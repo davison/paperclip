@@ -67,6 +67,12 @@ export function issueRoutes(
         now?: Date;
       }): Promise<unknown>;
     };
+    collectHeartbeatEnrichments?: (input: {
+      issueId: string;
+      companyId: string;
+      projectId: string | null;
+      assigneeAgentId: string | null;
+    }) => Promise<Record<string, Record<string, unknown>>>;
   },
 ) {
   const router = Router();
@@ -482,11 +488,19 @@ export function issueRoutes(
         ? req.query.wakeCommentId.trim()
         : null;
 
-    const [{ project, goal }, ancestors, commentCursor, wakeComment] = await Promise.all([
+    const [{ project, goal }, ancestors, commentCursor, wakeComment, pluginContext] = await Promise.all([
       resolveIssueProjectAndGoal(issue),
       svc.getAncestors(issue.id),
       svc.getCommentCursor(issue.id),
       wakeCommentId ? svc.getComment(wakeCommentId) : null,
+      opts?.collectHeartbeatEnrichments
+        ? opts.collectHeartbeatEnrichments({
+            issueId: issue.id,
+            companyId: issue.companyId,
+            projectId: issue.projectId,
+            assigneeAgentId: issue.assigneeAgentId,
+          })
+        : Promise.resolve(undefined),
     ]);
 
     res.json({
@@ -533,6 +547,9 @@ export function issueRoutes(
         wakeComment && wakeComment.issueId === issue.id
           ? wakeComment
           : null,
+      ...(pluginContext && Object.keys(pluginContext).length > 0
+        ? { pluginContext }
+        : {}),
     });
   });
 

@@ -46,6 +46,7 @@ import { setPluginEventBus } from "./services/activity-log.js";
 import { createPluginDevWatcher } from "./services/plugin-dev-watcher.js";
 import { createPluginHostServiceCleanup } from "./services/plugin-host-service-cleanup.js";
 import { pluginRegistryService } from "./services/plugin-registry.js";
+import { collectHeartbeatEnrichments } from "./services/plugin-heartbeat-enricher.js";
 import { createHostClientHandlers } from "@paperclipai/plugin-sdk";
 import type { BetterAuthSessionResult } from "./auth/better-auth.js";
 
@@ -154,8 +155,15 @@ export async function createApp(
   api.use(agentRoutes(db));
   api.use(assetRoutes(db, opts.storageService));
   api.use(projectRoutes(db));
+  // Late-bound ref so issueRoutes (mounted now) can call the enricher
+  // once workerManager is created below.
+  const workerManagerRef: { current: ReturnType<typeof createPluginWorkerManager> | null } = { current: null };
   api.use(issueRoutes(db, opts.storageService, {
     feedbackExportService: opts.feedbackExportService,
+    collectHeartbeatEnrichments: (input) =>
+      workerManagerRef.current
+        ? collectHeartbeatEnrichments(workerManagerRef.current, input)
+        : Promise.resolve({}),
   }));
   api.use(routineRoutes(db));
   api.use(executionWorkspaceRoutes(db));
@@ -169,6 +177,7 @@ export async function createApp(
   api.use(instanceSettingsRoutes(db));
   const hostServicesDisposers = new Map<string, () => void>();
   const workerManager = createPluginWorkerManager();
+  workerManagerRef.current = workerManager;
   const pluginRegistry = pluginRegistryService(db);
   const eventBus = createPluginEventBus();
   setPluginEventBus(eventBus);

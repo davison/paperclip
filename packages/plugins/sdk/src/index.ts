@@ -140,6 +140,8 @@ export type {
   GetDataParams,
   PerformActionParams,
   ExecuteToolParams,
+  EnrichHeartbeatContextParams,
+  EnrichHeartbeatContextResult,
   PluginModalBoundsRequest,
   PluginRenderCloseEvent,
   PluginLauncherRenderContextSnapshot,
@@ -181,9 +183,11 @@ export type {
   PluginActionsClient,
   PluginStreamsClient,
   PluginToolsClient,
+  PluginHeartbeatClient,
   PluginMetricsClient,
   PluginTelemetryClient,
   PluginLogger,
+  HeartbeatEnrichmentInput,
 } from "./types.js";
 
 // Supporting types for context clients
