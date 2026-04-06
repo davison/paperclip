@@ -1092,6 +1092,50 @@ export interface PluginStreamsClient {
 }
 
 // ---------------------------------------------------------------------------
+// Heartbeat context enrichment
+// ---------------------------------------------------------------------------
+
+/**
+ * Input passed to a heartbeat context enrichment handler.
+ *
+ * Plugins receive this when the host assembles a heartbeat-context response
+ * and can return additional data to merge in.
+ */
+export interface HeartbeatEnrichmentInput {
+  /** UUID of the issue being assembled. */
+  issueId: string;
+  /** UUID of the company owning the issue. */
+  companyId: string;
+  /** UUID of the project the issue belongs to, if any. */
+  projectId: string | null;
+  /** UUID of the agent assigned to the issue, if any. */
+  assigneeAgentId: string | null;
+}
+
+/**
+ * `ctx.heartbeat` — register a handler that enriches heartbeat-context responses.
+ *
+ * Requires `heartbeat.context.enrich` capability.
+ *
+ * Only one enrichment handler per plugin is supported. If called multiple times,
+ * the latest handler replaces the previous one.
+ */
+export interface PluginHeartbeatClient {
+  /**
+   * Register a heartbeat context enrichment handler.
+   *
+   * The handler receives issue metadata and returns a record of additional
+   * context to merge into the heartbeat-context response under the plugin's
+   * namespaced key.
+   *
+   * @param handler - Async function returning JSON-serializable enrichment data
+   */
+  registerEnrichment(
+    handler: (input: HeartbeatEnrichmentInput) => Promise<Record<string, unknown>>,
+  ): void;
+}
+
+// ---------------------------------------------------------------------------
 // Full plugin context
 // ---------------------------------------------------------------------------
 
@@ -1179,6 +1223,9 @@ export interface PluginContext {
 
   /** Register agent tool handlers. Requires `agent.tools.register`. */
   tools: PluginToolsClient;
+
+  /** Register heartbeat context enrichment handler. Requires `heartbeat.context.enrich`. */
+  heartbeat: PluginHeartbeatClient;
 
   /** Write plugin metrics. Requires `metrics.write`. */
   metrics: PluginMetricsClient;

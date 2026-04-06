@@ -627,6 +627,11 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
         toolHandlers.set(name, fn);
       },
     },
+    heartbeat: {
+      registerEnrichment(_handler) {
+        // No-op in test harness — enrichment is tested via integration tests
+      },
+    },
     metrics: {
       async write(name, value, tags) {
         requireCapability(manifest, capabilitySet, "metrics.write");

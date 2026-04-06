@@ -262,6 +262,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     fn: (params: unknown, runCtx: ToolRunContext) => Promise<ToolResult>;
   }>();
 
+  // Heartbeat context enrichment handler (at most one per plugin)
+  let heartbeatEnrichmentHandler: ((input: import("./types.js").HeartbeatEnrichmentInput) => Promise<Record<string, unknown>>) | null = null;
+
   // Agent session event callbacks (populated by sendMessage, cleared by close)
   const sessionEventCallbacks = new Map<string, (event: AgentSessionEvent) => void>();
 
@@ -787,6 +790,14 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
         },
       },
 
+      heartbeat: {
+        registerEnrichment(
+          handler: (input: import("./types.js").HeartbeatEnrichmentInput) => Promise<Record<string, unknown>>,
+        ): void {
+          heartbeatEnrichmentHandler = handler;
+        },
+      },
+
       metrics: {
         async write(name: string, value: number, tags?: Record<string, string>): Promise<void> {
           await callHost("metrics.write", { name, value, tags });
@@ -888,6 +899,9 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       case "executeTool":
         return handleExecuteTool(params as ExecuteToolParams);
 
+      case "enrichHeartbeatContext":
+        return handleEnrichHeartbeatContext(params as import("./protocol.js").EnrichHeartbeatContextParams);
+
       default:
         throw Object.assign(
           new Error(`Unknown method: ${method}`),
@@ -919,6 +933,7 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
     if (plugin.definition.onConfigChanged) supportedMethods.push("configChanged");
     if (plugin.definition.onHealth) supportedMethods.push("health");
     if (plugin.definition.onShutdown) supportedMethods.push("shutdown");
+    if (heartbeatEnrichmentHandler) supportedMethods.push("enrichHeartbeatContext");
 
     return { ok: true, supportedMethods };
   }
@@ -1050,6 +1065,21 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
       throw new Error(`No tool handler registered for "${params.toolName}"`);
     }
     return entry.fn(params.parameters, params.runContext);
+  }
+
+  async function handleEnrichHeartbeatContext(
+    params: import("./protocol.js").EnrichHeartbeatContextParams,
+  ): Promise<import("./protocol.js").EnrichHeartbeatContextResult> {
+    if (!heartbeatEnrichmentHandler) {
+      return { data: {} };
+    }
+    const data = await heartbeatEnrichmentHandler({
+      issueId: params.issueId,
+      companyId: params.companyId,
+      projectId: params.projectId,
+      assigneeAgentId: params.assigneeAgentId,
+    });
+    return { data };
   }
 
   // -----------------------------------------------------------------------

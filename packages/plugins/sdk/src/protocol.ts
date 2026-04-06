@@ -313,6 +313,35 @@ export interface ExecuteToolParams {
   runContext: ToolRunContext;
 }
 
+/**
+ * Input for the `enrichHeartbeatContext` RPC method.
+ *
+ * Sent by the host during heartbeat-context assembly. The plugin receives
+ * the base issue context and returns additional fields to merge into the
+ * response.
+ */
+export interface EnrichHeartbeatContextParams {
+  /** UUID of the issue being assembled. */
+  issueId: string;
+  /** UUID of the company owning the issue. */
+  companyId: string;
+  /** UUID of the project the issue belongs to, if any. */
+  projectId: string | null;
+  /** UUID of the agent assigned to the issue, if any. */
+  assigneeAgentId: string | null;
+}
+
+/**
+ * Result returned by a plugin's `enrichHeartbeatContext` handler.
+ *
+ * Each key-value pair is merged into the heartbeat-context response under
+ * a plugin-namespaced key. Values must be JSON-serializable.
+ */
+export interface EnrichHeartbeatContextResult {
+  /** Additional context to merge into the heartbeat response. */
+  data: Record<string, unknown>;
+}
+
 // ---------------------------------------------------------------------------
 // UI launcher / modal host interaction payloads
 // ---------------------------------------------------------------------------
@@ -380,6 +409,8 @@ export interface HostToWorkerMethods {
   performAction: [params: PerformActionParams, result: unknown];
   /** @see PLUGIN_SPEC.md §13.10 */
   executeTool: [params: ExecuteToolParams, result: ToolResult];
+  /** Heartbeat context enrichment hook. */
+  enrichHeartbeatContext: [params: EnrichHeartbeatContextParams, result: EnrichHeartbeatContextResult];
 }
 
 /** Union of all host→worker method names. */
@@ -402,6 +433,7 @@ export const HOST_TO_WORKER_OPTIONAL_METHODS: readonly HostToWorkerMethodName[] 
   "getData",
   "performAction",
   "executeTool",
+  "enrichHeartbeatContext",
 ] as const;
 
 // ---------------------------------------------------------------------------
