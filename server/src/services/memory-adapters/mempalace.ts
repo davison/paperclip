@@ -367,9 +367,11 @@ export function createMempalaceMemoryAdapter(
       };
     }
 
-    // mempalace has a single mempalace_search tool with optional wing/room filters
-    const wing = (req.metadataFilter?.wing as string) ?? scopeToWing(req.scope);
-    const room = (req.metadataFilter?.room as string) ?? scopeToRoom(req.scope);
+    // Search broadly by default — let mempalace's semantic ranking surface
+    // relevant content across agents and issues. Only apply wing/room filters
+    // when explicitly requested via metadataFilter (e.g. a targeted lookup).
+    const wing = req.metadataFilter?.wing as string | undefined;
+    const room = req.metadataFilter?.room as string | undefined;
     const topK = req.topK ?? 5;
 
     const toolArgs: Record<string, unknown> = {

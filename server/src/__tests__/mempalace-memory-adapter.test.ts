@@ -245,22 +245,7 @@ describe("MempalaceMemoryAdapter", () => {
     expect(result.snippets[0].handle.providerKey).toBe("mempalace");
   });
 
-  it("query: passes wing filter when project scope available", async () => {
-    mockCallTool.mockResolvedValue(searchResult([]));
-
-    await adapter.query({
-      bindingKey: "default",
-      scope: { companyId: "co-1", projectId: "proj-1" },
-      query: "test query",
-    });
-
-    const [callArgs] = mockCallTool.mock.calls[0];
-    expect(callArgs.name).toBe("mempalace_search");
-    expect(callArgs.arguments.wing).toBe("project-proj-1");
-    expect(callArgs.arguments.room).toBeUndefined();
-  });
-
-  it("query: passes wing and room filters when issue scope available", async () => {
+  it("query: does not auto-derive wing/room filters from scope", async () => {
     mockCallTool.mockResolvedValue(searchResult([]));
 
     await adapter.query({
@@ -271,8 +256,8 @@ describe("MempalaceMemoryAdapter", () => {
 
     const [callArgs] = mockCallTool.mock.calls[0];
     expect(callArgs.name).toBe("mempalace_search");
-    expect(callArgs.arguments.wing).toBe("project-proj-1");
-    expect(callArgs.arguments.room).toBe("issue-iss-1");
+    expect(callArgs.arguments.wing).toBeUndefined();
+    expect(callArgs.arguments.room).toBeUndefined();
   });
 
   it("query: falls back to single snippet for non-JSON response", async () => {
