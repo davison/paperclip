@@ -32,3 +32,22 @@ export { notifyHireApproved, type NotifyHireApprovedInput } from "./hire-hook.js
 export { publishLiveEvent, subscribeCompanyLiveEvents } from "./live-events.js";
 export { reconcilePersistedRuntimeServicesOnStartup, restartDesiredRuntimeServicesOnStartup } from "./workspace-runtime.js";
 export { createStorageServiceFromConfig, getStorageService } from "../storage/index.js";
+export { memoryBindingService } from "./memory-bindings.js";
+export {
+  memoryOperationService,
+  registerMemoryAdapter,
+  unregisterMemoryAdapter,
+  getRegisteredMemoryAdapters,
+  getMemoryAdapter,
+} from "./memory-operations.js";
+export { memoryHooksService } from "./memory-hooks.js";
+export type {
+  HydrateRunContextParams,
+  HydrateRunContextResult,
+  CaptureRunResultParams,
+  CaptureRunResultResult,
+  MemoryHooksConfig,
+} from "./memory-hooks.js";
+export { createParaMemoryAdapter, type ParaAdapterConfig } from "./memory-adapters/index.js";
+export { createMempalaceMemoryAdapter, type MempalaceAdapterConfig } from "./memory-adapters/index.js";
+export { createMempalaceSidecar, type MempalaceSidecarConfig, type MempalaceSidecar, type SidecarStatus } from "./memory-adapters/index.js";

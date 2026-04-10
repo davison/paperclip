@@ -31,6 +31,12 @@ import { assetRoutes } from "./routes/assets.js";
 import { accessRoutes } from "./routes/access.js";
 import { pluginRoutes } from "./routes/plugins.js";
 import { adapterRoutes } from "./routes/adapters.js";
+import { memoryBindingRoutes } from "./routes/memory-bindings.js";
+import { memoryOperationRoutes } from "./routes/memory-operations.js";
+import { registerMemoryAdapter } from "./services/memory-operations.js";
+import { createParaMemoryAdapter } from "./services/memory-adapters/index.js";
+import { createMempalaceMemoryAdapter } from "./services/memory-adapters/index.js";
+import { createMempalaceSidecar, type MempalaceSidecar } from "./services/memory-adapters/index.js";
 import { pluginUiStaticRoutes } from "./routes/plugin-ui-static.js";
 import { applyUiBranding } from "./ui-branding.js";
 import { logger } from "./middleware/logger.js";
@@ -164,6 +170,65 @@ export async function createApp(
   api.use(approvalRoutes(db));
   api.use(secretRoutes(db));
   api.use(costRoutes(db));
+  api.use(memoryBindingRoutes(db));
+  api.use(memoryOperationRoutes(db));
+
+  // Register built-in memory adapters
+  registerMemoryAdapter(createParaMemoryAdapter({ basePath: process.cwd() }));
+
+  // Optionally enable mempalace — two modes:
+  //   MEMPALACE_URL  → remote: connect to an existing mempalace MCP server (Docker/Podman)
+  //   MEMPALACE_ENABLED=true → local: spawn a child-process sidecar
+  let mempalaceSidecar: MempalaceSidecar | null = null;
+  const mempalaceUrl = process.env.MEMPALACE_URL;
+  if (mempalaceUrl) {
+    // Remote mode: connect to mempalace running in another container / host
+    const adapter = createMempalaceMemoryAdapter({
+      url: mempalaceUrl,
+      connectTimeoutMs: 15_000,
+      callTimeoutMs: 30_000,
+    });
+    try {
+      await adapter.connect();
+      registerMemoryAdapter(adapter);
+      logger.info({ url: mempalaceUrl }, "mempalace remote adapter connected and registered");
+    } catch (err) {
+      logger.error(
+        { err, url: mempalaceUrl },
+        "mempalace remote connection failed — mempalace adapter will not be available",
+      );
+    }
+  } else if (process.env.MEMPALACE_ENABLED === "true") {
+    // Local mode: spawn mempalace as a child process
+    const palaceDir = process.env.MEMPALACE_PALACE_DIR ?? path.join(process.cwd(), ".mempalace");
+    const pythonCommand = process.env.MEMPALACE_PYTHON_COMMAND ?? "python";
+    mempalaceSidecar = createMempalaceSidecar({
+      palaceDir,
+      pythonCommand,
+      onLog: (stream, data) => {
+        if (stream === "stderr") {
+          logger.warn({ sidecar: "mempalace" }, data);
+        } else {
+          logger.info({ sidecar: "mempalace" }, data);
+        }
+      },
+      onStatusChange: (status, error) => {
+        logger.info({ sidecar: "mempalace", status, error }, "mempalace sidecar status changed");
+      },
+    });
+    try {
+      await mempalaceSidecar.start();
+      registerMemoryAdapter(mempalaceSidecar.adapter);
+      logger.info({ palaceDir, pythonCommand }, "mempalace sidecar started and adapter registered");
+    } catch (err) {
+      logger.error(
+        { err, palaceDir, pythonCommand },
+        "mempalace sidecar failed to start — mempalace adapter will not be available",
+      );
+      mempalaceSidecar = null;
+    }
+  }
+
   api.use(activityRoutes(db));
   api.use(dashboardRoutes(db));
   api.use(sidebarBadgeRoutes(db));
@@ -335,6 +400,21 @@ export async function createApp(
   }).catch((err) => {
     logger.error({ err }, "Failed to load ready plugins on startup");
   });
+  // Async cleanup for mempalace sidecar — must happen before process.exit().
+  // The "exit" event is synchronous and cannot await promises, so we use
+  // signal handlers that fire before the index.ts shutdown calls process.exit(0).
+  const stopMempalace = async () => {
+    if (mempalaceSidecar) {
+      try {
+        await mempalaceSidecar.stop();
+      } catch (err) {
+        logger.warn({ err }, "mempalace sidecar stop failed during shutdown");
+      }
+    }
+  };
+  process.on("SIGTERM", () => { void stopMempalace(); });
+  process.on("SIGINT", () => { void stopMempalace(); });
+
   process.once("exit", () => {
     if (feedbackExportTimer) clearInterval(feedbackExportTimer);
     devWatcher?.close();
