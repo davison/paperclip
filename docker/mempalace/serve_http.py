@@ -16,6 +16,7 @@ import asyncio
 import os
 import json
 import logging
+import threading
 
 from starlette.applications import Starlette
 from starlette.requests import Request
@@ -30,6 +31,17 @@ logger = logging.getLogger("mempalace-http")
 PORT = int(os.environ.get("MEMPALACE_PORT", "8080"))
 PATH = os.environ.get("MEMPALACE_PATH", "/mcp")
 
+# mempalace uses a global SQLite connection (knowledge_graph.py) created with
+# check_same_thread=False.  Concurrent handle_request calls from the thread
+# pool would hit the same connection from different threads, risking data
+# corruption.  Serialize all calls through a single lock so only one request
+# touches SQLite (and the shared ChromaDB client) at a time.
+_request_lock = threading.Lock()
+
+
+def _locked_handle_request(body: dict) -> dict | None:
+    with _request_lock:
+        return handle_request(body)
 
 async def mcp_endpoint(request: Request) -> Response:
     """Accept a JSON-RPC request and return the response."""
@@ -43,7 +55,9 @@ async def mcp_endpoint(request: Request) -> Response:
 
     # handle_request is synchronous (blocking ChromaDB I/O under the hood),
     # so we run it in a thread pool to avoid blocking the event loop.
-    response = await asyncio.to_thread(handle_request, body)
+    # Access is serialized via _request_lock to prevent thread-unsafe SQLite
+    # and ChromaDB global state corruption from concurrent requests.
+    response = await asyncio.to_thread(_locked_handle_request, body)
     if response is None:
         # Notification — no response expected
         return Response(status_code=204)
