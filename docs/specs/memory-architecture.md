@@ -99,11 +99,15 @@ interface MemoryScope {
 
 ## Operation Logging
 
-Memory operations are logged to the `memory_operations` Postgres table on a **best-effort, non-blocking basis**. Both direct API calls and hook-initiated operations write log rows, but the insert is fire-and-forget (`.catch()` on failure) to avoid blocking the primary operation (`memory-operations.ts:122-131`, `memory-hooks.ts:220-229`, `:339-348`).
+Memory operations are logged to the `memory_operations` Postgres table on a **best-effort** basis — all log inserts swallow failures via `.catch()`, so a failed insert never causes the parent operation to fail. However, the blocking behaviour differs by call path:
+
+- **Direct API success paths** (`memory-operations.ts:122-131`, `:181-189`, `:226-234`): the `logOperation()` call is **not** awaited — truly fire-and-forget and non-blocking.
+- **Direct API failure paths** (`memory-operations.ts:138-148`, `:196-205`, `:241-250`): the `logOperation()` call **is** awaited before the error is re-thrown, so the log insert is on the critical path for error-response latency.
+- **Hook paths — both success and failure** (`memory-hooks.ts:220-229`, `:244-253`, `:339-348`, `:363-372`): `logHookOperation()` is always awaited, so the insert adds to hook completion latency even though failures are swallowed.
 
 **Persisted scope fields:** `agent_id`, `project_id`, `issue_id`, `run_id`. The `subjectId` field present in `MemoryScope` is **not** persisted in the `memory_operations` table (`0055_memory_bindings_and_operations.sql:23-38`). Operators should not rely on the operation log for `subjectId` traceability.
 
-Because logging is non-blocking, log rows may be dropped if the Postgres insert fails (e.g. transient connection issues). The operation log provides **operational visibility** into memory usage patterns, not a guaranteed audit trail of every operation.
+Because all logging inserts are best-effort, log rows may be dropped if the Postgres insert fails (e.g. transient connection issues). The operation log provides **operational visibility** into memory usage patterns, not a guaranteed audit trail of every operation.
 
 ## Memory Bindings
 
