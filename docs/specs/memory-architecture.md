@@ -1,15 +1,15 @@
 # Memory Architecture
 
-This document describes the memory adapter framework, its security model, and lifecycle integration. It covers the two built-in adapters (PARA and mempalace) and the hook system that drives automatic memory operations.
+This document describes the memory adapter framework, its security model, and lifecycle integration. It covers the upstream control plane (server + Postgres), the local adapter layer (storage providers), and the hook system that drives automatic memory operations.
 
 ## Overview
 
 Paperclip's memory system is a two-layer architecture:
 
-1. **Control plane** (Paperclip server) — owns bindings, scope mapping, provenance, lifecycle hooks, and operation logging.
-2. **Provider adapters** — own storage, indexing, and retrieval. Adapters implement the `MemoryAdapter` interface (`write`, `query`, `get`, `forget`) and declare optional capabilities via `MemoryAdapterCapabilities`.
+1. **Upstream (control plane)** — the Paperclip server owns bindings, scope construction, provenance, lifecycle hooks, and operation logging. All memory requests are mediated by the server; agents never interact with adapters directly.
+2. **Local (adapter layer)** — storage providers implement the `MemoryAdapter` interface (`write`, `query`, `get`, `forget`) and declare optional capabilities via `MemoryAdapterCapabilities`. Adapters own indexing, retrieval, and persistence in their own storage backend.
 
-Agents never interact with memory providers directly. The server mediates all memory operations and injects results into agent context.
+The built-in PARA adapter uses the local filesystem. The mempalace adapter demonstrates integration with an external MCP-based service. Third-party adapters can implement the same interface to provide alternative storage backends.
 
 ## Lifecycle Hooks
 
@@ -31,17 +31,27 @@ This means a company can register a memory adapter without any hooks firing unti
 
 ## Security Model
 
-Company isolation is enforced **differently by each adapter**, reflecting their distinct storage architectures. There is no single universal isolation mechanism across all adapters.
+Security is split between the upstream control plane and local adapters.
 
-### PARA adapter (filesystem-based)
+### Upstream scope validation
 
-PARA enforces company isolation at the filesystem path level:
+The server validates `scope.companyId` on every direct memory API call (write, query, forget). It checks that the caller-provided `scope.companyId` matches the binding's `companyId` (`memory-operations.ts:115-117`, `:157-159`, `:195-197`). If they do not match, the request is rejected with 403.
+
+**Scope fields below company level (`agentId`, `projectId`, `issueId`, `runId`, `subjectId`) are caller-provided and are not bound to the authenticated actor's identity.** The server does not verify that an agent calling the write endpoint is the same agent as `scope.agentId`. This means company-level isolation is enforced upstream, but sub-company scope fields are trusted from the caller within that company boundary.
+
+For hook-initiated operations (hydration and capture), the server constructs scope from the run context (`memory-hooks.ts:185-191`, `:305-311`), so these scope values are server-controlled and not caller-injectable.
+
+### Adapter-level isolation
+
+Each adapter is responsible for its own storage-level isolation. There is no single universal isolation mechanism across all adapters.
+
+**PARA adapter (filesystem-based):**
 
 - All file operations are scoped to `basePath/<companyId>/` directories.
 - `companyId` is validated as a UUID (`/^[0-9a-f]{8}-…$/i`) before any path resolution, preventing directory traversal via malformed scope values (`para.ts:217-222`).
 - Resolved paths are checked to ensure they remain within the company base directory — any path that escapes triggers a traversal error (`para.ts:231-236`).
 
-### Mempalace adapter (MCP-based)
+**Mempalace adapter (MCP-based):**
 
 Mempalace relies on **deployment-level separation** for company isolation, not on path validation or in-adapter scoping:
 
@@ -52,15 +62,16 @@ Mempalace relies on **deployment-level separation** for company isolation, not o
 
 ### Summary
 
-| Concern | PARA | Mempalace |
-|---------|------|-----------|
-| Company isolation | Filesystem path scoping with UUID validation | Deployment-level separation (requires one instance per company) |
-| Traversal prevention | Path-resolution check against company base dir | N/A (no filesystem paths in adapter) |
-| Sub-company scoping | Directory structure (PARA hierarchy) | Wings (project) and rooms (issue) |
+| Concern | Upstream (server) | PARA adapter | Mempalace adapter |
+|---------|-------------------|--------------|-------------------|
+| Company isolation | `companyId` match enforced on direct API calls | Filesystem path scoping with UUID validation | Deployment-level separation (one instance per company) |
+| Sub-company scope | Caller-provided; not validated against actor identity | Directory structure (PARA hierarchy) | Wings (project) and rooms (issue) |
+| Traversal prevention | N/A | Path-resolution check against company base dir | N/A (no filesystem paths in adapter) |
+| Hook-path scope | Server-constructed from run context (not caller-injectable) | N/A | N/A |
 
 ## Adapter Interface
 
-Both adapters implement the `MemoryAdapter` interface from `@paperclipai/plugin-sdk`:
+Both built-in adapters implement the `MemoryAdapter` interface from `@paperclipai/plugin-sdk`:
 
 ```typescript
 interface MemoryAdapter {
@@ -85,6 +96,14 @@ interface MemoryScope {
   subjectId?: string;
 }
 ```
+
+## Operation Logging
+
+Memory operations are logged to the `memory_operations` Postgres table on a **best-effort, non-blocking basis**. Both direct API calls and hook-initiated operations write log rows, but the insert is fire-and-forget (`.catch()` on failure) to avoid blocking the primary operation (`memory-operations.ts:122-131`, `memory-hooks.ts:220-229`, `:339-348`).
+
+**Persisted scope fields:** `agent_id`, `project_id`, `issue_id`, `run_id`. The `subjectId` field present in `MemoryScope` is **not** persisted in the `memory_operations` table (`0055_memory_bindings_and_operations.sql:23-38`). Operators should not rely on the operation log for `subjectId` traceability.
+
+Because logging is non-blocking, log rows may be dropped if the Postgres insert fails (e.g. transient connection issues). The operation log provides **operational visibility** into memory usage patterns, not a guaranteed audit trail of every operation.
 
 ## Memory Bindings
 
