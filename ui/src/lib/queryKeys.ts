@@ -30,8 +30,8 @@ export const queryKeys = {
   },
   issues: {
     list: (companyId: string) => ["issues", companyId] as const,
-    search: (companyId: string, q: string, projectId?: string) =>
-      ["issues", companyId, "search", q, projectId ?? "__all-projects__"] as const,
+    search: (companyId: string, q: string, projectId?: string, limit?: number) =>
+      ["issues", companyId, "search", q, projectId ?? "__all-projects__", limit ?? "__no-limit__"] as const,
     listAssignedToMe: (companyId: string) => ["issues", companyId, "assigned-to-me"] as const,
     listMineByMe: (companyId: string) => ["issues", companyId, "mine-by-me"] as const,
     listTouchedByMe: (companyId: string) => ["issues", companyId, "touched-by-me"] as const,
@@ -39,6 +39,8 @@ export const queryKeys = {
     labels: (companyId: string) => ["issues", companyId, "labels"] as const,
     listByProject: (companyId: string, projectId: string) =>
       ["issues", companyId, "project", projectId] as const,
+    listByParent: (companyId: string, parentId: string) =>
+      ["issues", companyId, "parent", parentId] as const,
     listByExecutionWorkspace: (companyId: string, executionWorkspaceId: string) =>
       ["issues", companyId, "execution-workspace", executionWorkspaceId] as const,
     detail: (id: string) => ["issues", "detail", id] as const,
@@ -98,6 +100,13 @@ export const queryKeys = {
     schedulerHeartbeats: ["instance", "scheduler-heartbeats"] as const,
     experimentalSettings: ["instance", "experimental-settings"] as const,
   },
+  memory: {
+    bindings: (companyId: string) => ["memory", "bindings", companyId] as const,
+    bindingDetail: (bindingId: string) => ["memory", "bindings", "detail", bindingId] as const,
+    targets: (bindingId: string) => ["memory", "targets", bindingId] as const,
+    operations: (companyId: string, filters?: Record<string, string | number | undefined>) =>
+      ["memory", "operations", companyId, filters ?? {}] as const,
+  },
   health: ["health"] as const,
   secrets: {
     list: (companyId: string) => ["secrets", companyId] as const,
@@ -105,6 +114,7 @@ export const queryKeys = {
   },
   dashboard: (companyId: string) => ["dashboard", companyId] as const,
   sidebarBadges: (companyId: string) => ["sidebar-badges", companyId] as const,
+  inboxDismissals: (companyId: string) => ["inbox-dismissals", companyId] as const,
   activity: (companyId: string) => ["activity", companyId] as const,
   costs: (companyId: string, from?: string, to?: string) =>
     ["costs", companyId, from, to] as const,

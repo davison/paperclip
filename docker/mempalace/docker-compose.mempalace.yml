@@ -1,0 +1,31 @@
+services:
+  paperclip:
+    image: your-paperclip-image
+    environment:
+      # other paperclip env vars..
+      MEMPALACE_URL: http://mempalace:8080/mcp
+    depends_on:
+      mempalace:
+        condition: service_healthy
+
+  mempalace:
+    build:
+      context: .
+      args:
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
+    volumes:
+      - mempalace-data:/data/mempalace
+    environment:
+      MEMPALACE_PALACE_PATH: /data/mempalace
+      MEMPALACE_PORT: 8080
+      USER_UID: ${USER_UID:-1000}
+      USER_GID: ${USER_GID:-1000}
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+volumes:
+  mempalace-data:
