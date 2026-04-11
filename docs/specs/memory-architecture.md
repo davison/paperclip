@@ -43,18 +43,18 @@ PARA enforces company isolation at the filesystem path level:
 
 ### Mempalace adapter (MCP-based)
 
-Mempalace enforces company isolation at the **process/deployment level**, not via path validation in the adapter layer:
+Mempalace relies on **deployment-level separation** for company isolation, not on path validation or in-adapter scoping:
 
-- Each company gets its own mempalace sidecar process with a separate palace data directory. Isolation is enforced by which sidecar instance the adapter connects to (`mempalace.ts:56-60`).
-- The adapter does not encode `companyId` into wing or room names — company identity is implicit in the connection target.
-- In remote mode, the server connects to a single `MEMPALACE_URL` endpoint (`app.ts:183-190`). Cross-company isolation in multi-company deployments requires running separate mempalace instances per company or equivalent network-level separation.
-- Within a company's mempalace instance, `projectId` maps to wings and `issueId` maps to rooms for finer-grained scoping (`mempalace.ts:70-78`).
+- The adapter does not encode `companyId` into wing or room names — company identity is implicit in which mempalace instance the adapter connects to (`mempalace.ts:56-60`).
+- **Local mode** (`MEMPALACE_ENABLED=true`): the server spawns a **single** mempalace sidecar process with one palace data directory per server process (`app.ts:201-206`). This mode does **not** provide per-company isolation out of the box. For multi-company deployments, each company must be served by a separate server process (each with its own sidecar), or operators must use remote mode with per-company instances.
+- **Remote mode** (`MEMPALACE_URL`): the server connects to a single endpoint (`app.ts:183-190`). Cross-company isolation requires running separate mempalace instances per company or equivalent network-level separation.
+- Within a mempalace instance, `projectId` maps to wings and `issueId` maps to rooms for finer-grained scoping (`mempalace.ts:70-78`).
 
 ### Summary
 
 | Concern | PARA | Mempalace |
 |---------|------|-----------|
-| Company isolation | Filesystem path scoping with UUID validation | Process/deployment-level separation |
+| Company isolation | Filesystem path scoping with UUID validation | Deployment-level separation (requires one instance per company) |
 | Traversal prevention | Path-resolution check against company base dir | N/A (no filesystem paths in adapter) |
 | Sub-company scoping | Directory structure (PARA hierarchy) | Wings (project) and rooms (issue) |
 

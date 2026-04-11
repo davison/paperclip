@@ -53,11 +53,12 @@ function decodeHandle(handle: MemoryRecordHandle): {
 // ---------------------------------------------------------------------------
 // Scope → mempalace hierarchy mapping
 //
-// Company isolation: each company gets its own mempalace sidecar process
-// with a separate palace directory. Isolation is enforced at the process
-// level (RED-47), not by wing naming. The adapter therefore does not
-// encode companyId into the wing — it is implicit in which sidecar the
-// adapter is connected to.
+// Company isolation: enforced at the deployment level, not by wing naming.
+// The adapter does not encode companyId into the wing — company identity
+// is implicit in which mempalace instance the adapter connects to.
+// In local mode, a single sidecar is spawned per server process (app.ts);
+// multi-company isolation requires separate server processes or remote
+// mode with per-company mempalace instances. See RED-47.
 //
 // Hierarchy:
 //   projectId  → wing   (e.g. "project-{short-id}")
