@@ -255,6 +255,64 @@ describe("ParaMemoryAdapter", () => {
     expect(result.usage![0].details?.factsSuperseded).toBe(0);
   });
 
+  // ── Escape round-trip regression tests ───────────────────────────────
+
+  it("round-trips literal backslash-n (\\\\n) without converting to newline", async () => {
+    const adapter = createParaMemoryAdapter({ basePath: dir });
+    const { records } = await adapter.write({
+      bindingKey: "default",
+      scope,
+      source,
+      content: "Config path is /etc\\nginx/conf.d",
+      metadata: { layer: "entity", entityPath: "areas/infra/nginx", factId: "nginx-001" },
+    });
+
+    const snippet = await adapter.get(records![0], scope);
+    expect(snippet!.text).toBe("Config path is /etc\\nginx/conf.d");
+  });
+
+  it("round-trips Windows paths with backslashes", async () => {
+    const adapter = createParaMemoryAdapter({ basePath: dir });
+    const { records } = await adapter.write({
+      bindingKey: "default",
+      scope,
+      source,
+      content: "C:\\new\\notes",
+      metadata: { layer: "entity", entityPath: "resources/paths", factId: "win-001" },
+    });
+
+    const snippet = await adapter.get(records![0], scope);
+    expect(snippet!.text).toBe("C:\\new\\notes");
+  });
+
+  it("round-trips values containing real newlines", async () => {
+    const adapter = createParaMemoryAdapter({ basePath: dir });
+    const { records } = await adapter.write({
+      bindingKey: "default",
+      scope,
+      source,
+      content: "line one\nline two\nline three",
+      metadata: { layer: "entity", entityPath: "areas/notes", factId: "multi-001" },
+    });
+
+    const snippet = await adapter.get(records![0], scope);
+    expect(snippet!.text).toBe("line one\nline two\nline three");
+  });
+
+  it("round-trips mixed escape content (backslashes, newlines, quotes)", async () => {
+    const adapter = createParaMemoryAdapter({ basePath: dir });
+    const { records } = await adapter.write({
+      bindingKey: "default",
+      scope,
+      source,
+      content: 'She said "hello\\nworld"\nand left',
+      metadata: { layer: "entity", entityPath: "areas/misc", factId: "mixed-001" },
+    });
+
+    const snippet = await adapter.get(records![0], scope);
+    expect(snippet!.text).toBe('She said "hello\\nworld"\nand left');
+  });
+
   // ── Full roundtrip ──────────────────────────────────────────────────
 
   it("validates full path: write → get → query → forget", async () => {

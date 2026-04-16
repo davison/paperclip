@@ -114,7 +114,14 @@ function parseItemsYaml(raw: string): ParaFact[] {
 
 function unquote(v: string): string {
   if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-    return v.slice(1, -1);
+    const inner = v.slice(1, -1);
+    // Single-pass: consume \\ as a unit before \n can match within a literal backslash-n
+    return inner.replace(/\\(\\|n|")/g, (_, ch) => {
+      if (ch === "\\") return "\\";
+      if (ch === "n") return "\n";
+      if (ch === '"') return '"';
+      return ch;
+    });
   }
   return v;
 }
@@ -138,8 +145,12 @@ function serializeItemsYaml(facts: ParaFact[]): string {
         }
       } else if (v === null) {
         lines.push(`${prefix}${k}: null`);
-      } else if (typeof v === "string" && /[:#\[\]{},"']/.test(v)) {
-        lines.push(`${prefix}${k}: "${v}"`);
+      } else if (typeof v === "string" && /[:#\[\]{},"'\\\n]/.test(v)) {
+        const escaped = v
+          .replace(/\\/g, "\\\\")
+          .replace(/\n/g, "\\n")
+          .replace(/"/g, '\\"');
+        lines.push(`${prefix}${k}: "${escaped}"`);
       } else {
         lines.push(`${prefix}${k}: ${v}`);
       }
