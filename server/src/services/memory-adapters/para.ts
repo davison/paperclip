@@ -114,7 +114,13 @@ function parseItemsYaml(raw: string): ParaFact[] {
 
 function unquote(v: string): string {
   if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
-    return v.slice(1, -1).replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\");
+    // Single-pass decode so that `\\` is consumed before `\n` can match
+    // within a literal backslash-n sequence (e.g. Windows paths).
+    return v.slice(1, -1).replace(/\\(\\|n|")/g, (_, ch) => {
+      if (ch === "n") return "\n";
+      if (ch === '"') return '"';
+      return ch; // ch === "\\"
+    });
   }
   return v;
 }

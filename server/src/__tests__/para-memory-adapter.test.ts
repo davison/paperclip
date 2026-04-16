@@ -255,6 +255,74 @@ describe("ParaMemoryAdapter", () => {
     expect(result.usage![0].details?.factsSuperseded).toBe(0);
   });
 
+  // ── YAML escape round-trip regression ────────────────────────────────
+
+  it("round-trips literal backslash-n without corruption", async () => {
+    const adapter = createParaMemoryAdapter({ basePath: dir });
+    const literal = "contains a literal \\n escape sequence";
+    const { records } = await adapter.write({
+      bindingKey: "default",
+      scope,
+      source,
+      content: literal,
+      metadata: { layer: "entity", entityPath: "resources/esctest", factId: "esc-001" },
+    });
+
+    const snippet = await adapter.get(records![0], scope);
+    expect(snippet).not.toBeNull();
+    expect(snippet!.text).toBe(literal);
+    // Must NOT contain a real newline
+    expect(snippet!.text).not.toContain("\n");
+  });
+
+  it("round-trips Windows-style paths without corruption", async () => {
+    const adapter = createParaMemoryAdapter({ basePath: dir });
+    const winPath = "C:\\new\\notes\\november";
+    const { records } = await adapter.write({
+      bindingKey: "default",
+      scope,
+      source,
+      content: winPath,
+      metadata: { layer: "entity", entityPath: "resources/esctest", factId: "esc-002" },
+    });
+
+    const snippet = await adapter.get(records![0], scope);
+    expect(snippet).not.toBeNull();
+    expect(snippet!.text).toBe(winPath);
+  });
+
+  it("round-trips real multiline values", async () => {
+    const adapter = createParaMemoryAdapter({ basePath: dir });
+    const multiline = "line one\nline two\nline three";
+    const { records } = await adapter.write({
+      bindingKey: "default",
+      scope,
+      source,
+      content: multiline,
+      metadata: { layer: "entity", entityPath: "resources/esctest", factId: "esc-003" },
+    });
+
+    const snippet = await adapter.get(records![0], scope);
+    expect(snippet).not.toBeNull();
+    expect(snippet!.text).toBe(multiline);
+  });
+
+  it("round-trips mixed backslashes, newlines, and quotes", async () => {
+    const adapter = createParaMemoryAdapter({ basePath: dir });
+    const mixed = 'path: "C:\\tmp\\new"\nstatus: ok';
+    const { records } = await adapter.write({
+      bindingKey: "default",
+      scope,
+      source,
+      content: mixed,
+      metadata: { layer: "entity", entityPath: "resources/esctest", factId: "esc-004" },
+    });
+
+    const snippet = await adapter.get(records![0], scope);
+    expect(snippet).not.toBeNull();
+    expect(snippet!.text).toBe(mixed);
+  });
+
   // ── Full roundtrip ──────────────────────────────────────────────────
 
   it("validates full path: write → get → query → forget", async () => {
