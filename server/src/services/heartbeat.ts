@@ -1212,9 +1212,11 @@ function shouldAutoCheckoutIssueForWake(input: {
   contextSnapshot: Record<string, unknown> | null | undefined;
   issueStatus: string | null;
   issueAssigneeAgentId: string | null;
+  isDependencyReady: boolean;
   agentId: string;
 }) {
   if (input.issueAssigneeAgentId !== input.agentId) return false;
+  if (!input.isDependencyReady) return false;
 
   const issueStatus = readNonEmptyString(input.issueStatus);
   if (
@@ -3063,6 +3065,36 @@ export function heartbeatService(db: Db) {
     };
   }
 
+  function issueRunPriorityRank(priority: string | null | undefined) {
+    switch (priority) {
+      case "critical":
+        return 0;
+      case "high":
+        return 1;
+      case "medium":
+        return 2;
+      case "low":
+        return 3;
+      default:
+        return 4;
+    }
+  }
+
+  async function listQueuedRunDependencyReadiness(
+    companyId: string,
+    queuedRuns: Array<typeof heartbeatRuns.$inferSelect>,
+  ) {
+    const issueIds = [...new Set(
+      queuedRuns
+        .map((run) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
+        .filter((issueId): issueId is string => Boolean(issueId)),
+    )];
+    if (issueIds.length === 0) {
+      return new Map<string, Awaited<ReturnType<typeof issuesSvc.getDependencyReadiness>>>();
+    }
+    return issuesSvc.listDependencyReadiness(companyId, issueIds);
+  }
+
   async function countRunningRunsForAgent(agentId: string) {
     const [{ count }] = await db
       .select({ count: sql<number>`count(*)` })
@@ -3091,6 +3123,16 @@ export function heartbeatService(db: Db) {
     if (budgetBlock) {
       await cancelRunInternal(run.id, budgetBlock.reason);
       return null;
+    }
+
+    const issueId = readNonEmptyString(context.issueId);
+    if (issueId) {
+      const dependencyReadiness = await issuesSvc.listDependencyReadiness(run.companyId, [issueId]);
+      const unresolvedBlockerCount = dependencyReadiness.get(issueId)?.unresolvedBlockerCount ?? 0;
+      if (unresolvedBlockerCount > 0) {
+        logger.debug({ runId: run.id, issueId, unresolvedBlockerCount }, "claimQueuedRun: skipping blocked run");
+        return null;
+      }
     }
 
     const claimedAt = new Date();
@@ -3860,12 +3902,49 @@ export function heartbeatService(db: Db) {
         .select()
         .from(heartbeatRuns)
         .where(and(eq(heartbeatRuns.agentId, agentId), eq(heartbeatRuns.status, "queued")))
-        .orderBy(asc(heartbeatRuns.createdAt))
-        .limit(availableSlots);
+        .orderBy(asc(heartbeatRuns.createdAt));
       if (queuedRuns.length === 0) return [];
 
+      const dependencyReadiness = await listQueuedRunDependencyReadiness(agent.companyId, queuedRuns);
+      const queuedIssueIds = [...new Set(
+        queuedRuns
+          .map((run) => readNonEmptyString(parseObject(run.contextSnapshot).issueId))
+          .filter((issueId): issueId is string => Boolean(issueId)),
+      )];
+      const issueRows = await db
+        .select({
+          id: issues.id,
+          status: issues.status,
+          priority: issues.priority,
+        })
+        .from(issues)
+        .where(
+          queuedIssueIds.length > 0
+            ? and(eq(issues.companyId, agent.companyId), inArray(issues.id, queuedIssueIds))
+            : sql`false`,
+        );
+      const issueById = new Map(issueRows.map((row) => [row.id, row]));
+      const prioritizedRuns = [...queuedRuns].sort((left, right) => {
+        const leftIssueId = readNonEmptyString(parseObject(left.contextSnapshot).issueId);
+        const rightIssueId = readNonEmptyString(parseObject(right.contextSnapshot).issueId);
+        const leftReadiness = leftIssueId ? dependencyReadiness.get(leftIssueId) : null;
+        const rightReadiness = rightIssueId ? dependencyReadiness.get(rightIssueId) : null;
+        const leftReady = leftIssueId ? (leftReadiness?.isDependencyReady ?? true) : true;
+        const rightReady = rightIssueId ? (rightReadiness?.isDependencyReady ?? true) : true;
+        const leftIssue = leftIssueId ? issueById.get(leftIssueId) : null;
+        const rightIssue = rightIssueId ? issueById.get(rightIssueId) : null;
+        const leftRank = leftIssueId ? (leftReady ? (leftIssue?.status === "in_progress" ? 0 : 1) : 3) : 2;
+        const rightRank = rightIssueId ? (rightReady ? (rightIssue?.status === "in_progress" ? 0 : 1) : 3) : 2;
+        if (leftRank !== rightRank) return leftRank - rightRank;
+        const leftPriorityRank = issueRunPriorityRank(leftIssue?.priority);
+        const rightPriorityRank = issueRunPriorityRank(rightIssue?.priority);
+        if (leftPriorityRank !== rightPriorityRank) return leftPriorityRank - rightPriorityRank;
+        return left.createdAt.getTime() - right.createdAt.getTime();
+      });
+
       const claimedRuns: Array<typeof heartbeatRuns.$inferSelect> = [];
-      for (const queuedRun of queuedRuns) {
+      for (const queuedRun of prioritizedRuns) {
+        if (claimedRuns.length >= availableSlots) break;
         const claimed = await claimQueuedRun(queuedRun);
         if (claimed) claimedRuns.push(claimed);
       }
@@ -3888,7 +3967,7 @@ export function heartbeatService(db: Db) {
     if (run.status === "queued") {
       const claimed = await claimQueuedRun(run);
       if (!claimed) {
-        // Another worker has already claimed or finalized this run.
+        // claimQueuedRun can also leave the run queued when dependencies are unresolved.
         return;
       }
       run = claimed;
@@ -3919,6 +3998,9 @@ export function heartbeatService(db: Db) {
     const sessionCodec = getAdapterSessionCodec(agent.adapterType);
     const issueId = readNonEmptyString(context.issueId);
     let issueContext = issueId ? await getIssueExecutionContext(agent.companyId, issueId) : null;
+    const issueDependencyReadiness = issueId
+      ? await issuesSvc.listDependencyReadiness(agent.companyId, [issueId]).then((rows) => rows.get(issueId) ?? null)
+      : null;
     if (
       issueId &&
       issueContext &&
@@ -3926,6 +4008,7 @@ export function heartbeatService(db: Db) {
         contextSnapshot: context,
         issueStatus: issueContext.status,
         issueAssigneeAgentId: issueContext.assigneeAgentId,
+        isDependencyReady: issueDependencyReadiness?.isDependencyReady ?? true,
         agentId: agent.id,
       })
     ) {
