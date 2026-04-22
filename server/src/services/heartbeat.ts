@@ -6849,6 +6849,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             isSameExecutionAgent;
 
           if (isSameExecutionAgent && !shouldQueueFollowupForRunningWake) {
+            const promotingScheduledRetry = activeExecutionRun.status === "scheduled_retry";
             const mergedContextSnapshot = mergeCoalescedContextSnapshot(
               activeExecutionRun.contextSnapshot,
               enrichedContextSnapshot,
@@ -6858,6 +6859,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
               .set({
                 contextSnapshot: mergedContextSnapshot,
                 updatedAt: new Date(),
+                ...(promotingScheduledRetry ? { status: "queued" as const, scheduledRetryAt: null } : {}),
               })
               .where(eq(heartbeatRuns.id, activeExecutionRun.id))
               .returning()
@@ -7042,6 +7044,7 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       (shouldQueueFollowupForRunningWake ? null : sameScopeRunningRun ?? null);
 
     if (coalescedTargetRun) {
+      const promotingScheduledRetry = coalescedTargetRun.status === "scheduled_retry";
       const mergedContextSnapshot = mergeCoalescedContextSnapshot(
         coalescedTargetRun.contextSnapshot,
         contextSnapshot,
@@ -7051,6 +7054,9 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         .set({
           contextSnapshot: mergedContextSnapshot,
           updatedAt: new Date(),
+          // Promote scheduled_retry → queued so the coalesced wake executes
+          // immediately instead of waiting for the original scheduledRetryAt time.
+          ...(promotingScheduledRetry ? { status: "queued" as const, scheduledRetryAt: null } : {}),
         })
         .where(eq(heartbeatRuns.id, coalescedTargetRun.id))
         .returning()
@@ -7071,6 +7077,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         runId: mergedRun.id,
         finishedAt: new Date(),
       });
+
+      if (promotingScheduledRetry) {
+        await startNextQueuedRunForAgent(agent.id);
+      }
       return mergedRun;
     }
 
