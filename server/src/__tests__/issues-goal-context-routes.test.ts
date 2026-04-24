@@ -9,6 +9,7 @@ const mockIssueService = vi.hoisted(() => ({
   findMentionedProjectIds: vi.fn(),
   getCommentCursor: vi.fn(),
   getComment: vi.fn(),
+  listBlockerAttention: vi.fn(),
   listAttachments: vi.fn(),
 }));
 
@@ -41,6 +42,7 @@ function registerModuleMocks() {
       getById: vi.fn(),
     }),
     documentService: () => mockDocumentsService,
+    environmentService: () => ({}),
     executionWorkspaceService: () => mockExecutionWorkspaceService,
     feedbackService: () => ({
       listIssueVotesForUser: vi.fn(async () => []),
@@ -84,6 +86,10 @@ function registerModuleMocks() {
     workProductService: () => ({
       listForIssue: vi.fn(async () => []),
     }),
+  }));
+
+  vi.doMock("../services/execution-workspaces.js", () => ({
+    executionWorkspaceService: () => mockExecutionWorkspaceService,
   }));
 }
 
@@ -145,6 +151,7 @@ describe("issue goal context routes", () => {
   beforeEach(() => {
     vi.resetModules();
     vi.doUnmock("../services/index.js");
+    vi.doUnmock("../services/execution-workspaces.js");
     vi.doUnmock("../routes/issues.js");
     vi.doUnmock("../routes/authz.js");
     vi.doUnmock("../middleware/index.js");
@@ -160,6 +167,7 @@ describe("issue goal context routes", () => {
       latestCommentAt: null,
     });
     mockIssueService.getComment.mockResolvedValue(null);
+    mockIssueService.listBlockerAttention.mockResolvedValue(new Map());
     mockIssueService.listAttachments.mockResolvedValue([]);
     mockDocumentsService.getIssueDocumentPayload.mockResolvedValue({});
     mockDocumentsService.getIssueDocumentByKey.mockResolvedValue(null);
