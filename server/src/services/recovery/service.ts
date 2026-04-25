@@ -82,6 +82,7 @@ export type RunOutputSilenceSummary = {
   snoozedUntil: Date | null;
   evaluationIssueId: string | null;
   evaluationIssueIdentifier: string | null;
+  evaluationIssueAssigneeAgentId: string | null;
 };
 
 function readNonEmptyString(value: unknown): string | null {
@@ -590,6 +591,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
       snoozedUntil: quietUntilDecision?.snoozedUntil ?? null,
       evaluationIssueId: evaluation?.id ?? null,
       evaluationIssueIdentifier: evaluation?.identifier ?? null,
+      evaluationIssueAssigneeAgentId: evaluation?.assigneeAgentId ?? null,
     };
   }
 

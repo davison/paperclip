@@ -3550,6 +3550,90 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
     const promotedRunIds: string[] = [];
 
     for (const dueRun of dueRuns) {
+      const dueRunIssueId = readNonEmptyString(parseObject(dueRun.contextSnapshot).issueId);
+      if (dueRunIssueId) {
+        const issue = await db
+          .select({
+            id: issues.id,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
+            executionRunId: issues.executionRunId,
+          })
+          .from(issues)
+          .where(and(eq(issues.id, dueRunIssueId), eq(issues.companyId, dueRun.companyId)))
+          .then((rows) => rows[0] ?? null);
+
+        if (issue && (issue.assigneeAgentId !== dueRun.agentId || issue.status === "cancelled")) {
+          const issueCancelled = issue.status === "cancelled";
+          const reason = issueCancelled
+            ? "Cancelled because the issue was cancelled before the scheduled retry became due"
+            : "Cancelled because the issue was reassigned before the scheduled retry became due";
+          const cancelled = await db
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: reason,
+              errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
+              updatedAt: now,
+            })
+            .where(
+              and(
+                eq(heartbeatRuns.id, dueRun.id),
+                eq(heartbeatRuns.status, "scheduled_retry"),
+                lte(heartbeatRuns.scheduledRetryAt, now),
+              ),
+            )
+            .returning()
+            .then((rows) => rows[0] ?? null);
+
+          if (!cancelled) continue;
+
+          if (cancelled.wakeupRequestId) {
+            await db
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: reason,
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, cancelled.wakeupRequestId));
+          }
+
+          if (issue.executionRunId === cancelled.id) {
+            await db
+              .update(issues)
+              .set({
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+                updatedAt: now,
+              })
+              .where(and(eq(issues.id, issue.id), eq(issues.executionRunId, cancelled.id)));
+          }
+
+          await appendRunEvent(cancelled, await nextRunEventSeq(cancelled.id), {
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: issueCancelled
+              ? "Scheduled retry cancelled because issue was cancelled before it became due"
+              : "Scheduled retry cancelled because issue ownership changed before it became due",
+            payload: {
+              issueId: issue.id,
+              issueStatus: issue.status,
+              scheduledRetryAttempt: cancelled.scheduledRetryAttempt,
+              scheduledRetryAt: cancelled.scheduledRetryAt ? new Date(cancelled.scheduledRetryAt).toISOString() : null,
+              scheduledRetryReason: cancelled.scheduledRetryReason,
+              previousRetryAgentId: cancelled.agentId,
+              currentAssigneeAgentId: issue.assigneeAgentId,
+            },
+          });
+          continue;
+        }
+      }
+
       const promoted = await db
         .update(heartbeatRuns)
         .set({
@@ -6352,6 +6436,8 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           .select({
             id: issues.id,
             companyId: issues.companyId,
+            status: issues.status,
+            assigneeAgentId: issues.assigneeAgentId,
             executionRunId: issues.executionRunId,
             executionAgentNameKey: issues.executionAgentNameKey,
           })
@@ -6376,6 +6462,88 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
           return { kind: "skipped" as const };
         }
 
+        const cancelStaleScheduledRetry = async (scheduledRun: typeof heartbeatRuns.$inferSelect) => {
+          const issueCancelled = issue.status === "cancelled";
+          if (
+            scheduledRun.status !== "scheduled_retry" ||
+            (scheduledRun.agentId === issue.assigneeAgentId && !issueCancelled)
+          ) {
+            return false;
+          }
+
+          const now = new Date();
+          const reason = issueCancelled
+            ? "Cancelled because the issue was cancelled before the scheduled retry became due"
+            : "Cancelled because the issue was reassigned before the scheduled retry became due";
+          const cancelled = await tx
+            .update(heartbeatRuns)
+            .set({
+              status: "cancelled",
+              finishedAt: now,
+              error: reason,
+              errorCode: issueCancelled ? "issue_cancelled" : "issue_reassigned",
+              updatedAt: now,
+            })
+            .where(and(eq(heartbeatRuns.id, scheduledRun.id), eq(heartbeatRuns.status, "scheduled_retry")))
+            .returning()
+            .then((rows) => rows[0] ?? null);
+
+          if (!cancelled) return false;
+
+          if (scheduledRun.wakeupRequestId) {
+            await tx
+              .update(agentWakeupRequests)
+              .set({
+                status: "cancelled",
+                finishedAt: now,
+                error: reason,
+                updatedAt: now,
+              })
+              .where(eq(agentWakeupRequests.id, scheduledRun.wakeupRequestId));
+          }
+
+          if (issue.executionRunId === scheduledRun.id) {
+            await tx
+              .update(issues)
+              .set({
+                executionRunId: null,
+                executionAgentNameKey: null,
+                executionLockedAt: null,
+                updatedAt: now,
+              })
+              .where(and(eq(issues.id, issue.id), eq(issues.executionRunId, scheduledRun.id)));
+          }
+
+          const [eventSeq] = await tx
+            .select({ maxSeq: sql<number | null>`max(${heartbeatRunEvents.seq})` })
+            .from(heartbeatRunEvents)
+            .where(eq(heartbeatRunEvents.runId, cancelled.id));
+
+          await tx.insert(heartbeatRunEvents).values({
+            companyId: cancelled.companyId,
+            runId: cancelled.id,
+            agentId: cancelled.agentId,
+            seq: Number(eventSeq?.maxSeq ?? 0) + 1,
+            eventType: "lifecycle",
+            stream: "system",
+            level: "warn",
+            message: issueCancelled
+              ? "Scheduled retry cancelled because issue was cancelled before it became due"
+              : "Scheduled retry cancelled because issue ownership changed before it became due",
+            payload: {
+              issueId: issue.id,
+              issueStatus: issue.status,
+              scheduledRetryAttempt: cancelled.scheduledRetryAttempt,
+              scheduledRetryAt: cancelled.scheduledRetryAt ? new Date(cancelled.scheduledRetryAt).toISOString() : null,
+              scheduledRetryReason: cancelled.scheduledRetryReason,
+              previousRetryAgentId: cancelled.agentId,
+              currentAssigneeAgentId: issue.assigneeAgentId,
+            },
+          });
+
+          return true;
+        };
+
         let activeExecutionRun = issue.executionRunId
           ? await tx
             .select()
@@ -6390,6 +6558,10 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             activeExecutionRun.status as (typeof EXECUTION_PATH_HEARTBEAT_RUN_STATUSES)[number],
           )
         ) {
+          activeExecutionRun = null;
+        }
+
+        if (activeExecutionRun && await cancelStaleScheduledRetry(activeExecutionRun)) {
           activeExecutionRun = null;
         }
 
@@ -6424,21 +6596,25 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
             .then((rows) => rows[0] ?? null);
 
           if (legacyRun) {
-            activeExecutionRun = legacyRun;
-            const legacyAgent = await tx
-              .select({ name: agents.name })
-              .from(agents)
-              .where(eq(agents.id, legacyRun.agentId))
-              .then((rows) => rows[0] ?? null);
-            await tx
-              .update(issues)
-              .set({
-                executionRunId: legacyRun.id,
-                executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
-                executionLockedAt: new Date(),
-                updatedAt: new Date(),
-              })
-              .where(eq(issues.id, issue.id));
+            if (await cancelStaleScheduledRetry(legacyRun)) {
+              activeExecutionRun = null;
+            } else {
+              activeExecutionRun = legacyRun;
+              const legacyAgent = await tx
+                .select({ name: agents.name })
+                .from(agents)
+                .where(eq(agents.id, legacyRun.agentId))
+                .then((rows) => rows[0] ?? null);
+              await tx
+                .update(issues)
+                .set({
+                  executionRunId: legacyRun.id,
+                  executionAgentNameKey: normalizeAgentNameKey(legacyAgent?.name),
+                  executionLockedAt: new Date(),
+                  updatedAt: new Date(),
+                })
+                .where(eq(issues.id, issue.id));
+            }
           }
         }
 

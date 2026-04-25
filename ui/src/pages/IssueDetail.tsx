@@ -837,6 +837,7 @@ const IssueDetailChatTab = memo(function IssueDetailChatTab({
 
 type IssueDetailActivityTabProps = {
   issueId: string;
+  companyId: string;
   issueStatus: Issue["status"];
   childIssues: Issue[];
   agentMap: Map<string, Agent>;
@@ -850,6 +851,7 @@ type IssueDetailActivityTabProps = {
 
 function IssueDetailActivityTab({
   issueId,
+  companyId,
   issueStatus,
   childIssues,
   agentMap,
@@ -941,6 +943,7 @@ function IssueDetailActivityTab({
       <div className="mb-3">
         <IssueRunLedger
           issueId={issueId}
+          companyId={companyId}
           issueStatus={issueStatus}
           childIssues={childIssues}
           agentMap={agentMap}
@@ -3410,6 +3413,7 @@ export function IssueDetail() {
           {detailTab === "activity" ? (
             <IssueDetailActivityTab
               issueId={issue.id}
+              companyId={issue.companyId}
               issueStatus={issue.status}
               childIssues={childIssues}
               agentMap={agentMap}
