@@ -1,7 +1,8 @@
 import { randomUUID } from "node:crypto";
-import { mkdtemp, rm, mkdir, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, mkdir, writeFile, readFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { and, eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
@@ -67,6 +68,84 @@ describe("plugin database SQL validation", () => {
     expect(() =>
       validatePluginRuntimeExecute("UPDATE public.issues SET title = $1", "plugin_test")
     ).toThrow(/namespace/i);
+  });
+
+  it("allows CREATE INDEX statements on namespace tables", () => {
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE INDEX idx_facts_company ON plugin_test.facts (company_id)",
+        "plugin_test",
+        [],
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE INDEX idx_facts_content_trgm ON plugin_test.facts USING gin(content gin_trgm_ops)",
+        "plugin_test",
+        [],
+      )
+    ).not.toThrow();
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_unique ON plugin_test.facts (id)",
+        "plugin_test",
+        [],
+      )
+    ).not.toThrow();
+  });
+
+  it("rejects CREATE INDEX targeting public or other schemas", () => {
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE INDEX idx_issues_extra ON public.issues (title)",
+        "plugin_test",
+        ["issues"],
+      )
+    ).toThrow(/public/i);
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE INDEX idx_other ON other_schema.facts (id)",
+        "plugin_test",
+        [],
+      )
+    ).toThrow(/namespace|schema/i);
+  });
+
+  it("rejects CREATE INDEX without a fully qualified table reference", () => {
+    expect(() =>
+      validatePluginMigrationStatement(
+        "CREATE INDEX idx_unqualified ON facts (id)",
+        "plugin_test",
+        [],
+      )
+    ).toThrow(/fully qualified/i);
+  });
+
+  it("accepts every statement in the quipo plugin's 001_init_memory.sql", async () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const migrationPath = path.resolve(
+      here,
+      "../../../packages/plugins/quipo/migrations/001_init_memory.sql",
+    );
+    const sql = await readFile(migrationPath, "utf8");
+    const stripped = sql
+      .replace(/\/\*[\s\S]*?\*\//g, "")
+      .replace(/--.*$/gm, "");
+    const statements = stripped
+      .split(";")
+      .map((s) => s.trim())
+      .filter((s) => s.length > 0);
+
+    expect(statements.length).toBeGreaterThan(0);
+    for (const statement of statements) {
+      expect(() =>
+        validatePluginMigrationStatement(
+          statement,
+          "plugin_quipo_d14f4ce0c0",
+          ["companies", "issues", "agents", "issue_comments"],
+        )
+      ).not.toThrow();
+    }
   });
 
   it("targets anonymous DO blocks without rejecting do-prefixed aliases", () => {
