@@ -59,4 +59,4 @@ If your LLM supports structured outputs / JSON mode, use it. The plugin will rej
 
 - Plugin: `paperclipai.plugin-quipo`
 - Storage: `plugin_quipo_d14f4ce0c0.{facts,sessions,peer_models}` (managed by the plugin, not by you)
-- Prompt module: `@paperclipai/plugin-quipo` re-exports the canonical extraction system prompt and JSON schema; the plugin assembles the per-task user prompt and parses your response with the same module.
+- Prompt module: `@paperclipai/plugin-quipo` (or the `./prompts` subpath) re-exports the canonical extraction system prompt, zod schema, and JSON schema. The plugin assembles the per-task user prompt and parses your response with the same module — you never need to load it yourself, and the bundled worker entry point does NOT depend on it.
