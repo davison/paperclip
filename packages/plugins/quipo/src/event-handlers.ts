@@ -20,6 +20,13 @@ const MAX_PARSE_ERROR_ATTEMPTS = 2;
 
 const FACT_BEARING_PATCH_KEYS: ReadonlySet<string> = new Set(["title", "description"]);
 
+// Cap the comment body we embed in the extraction issue. The host-emitted
+// `bodySnippet` is only ~120 chars (truncated at the platform), which routinely
+// cuts mid-sentence and starves the memory-worker (RED-131). Live handlers now
+// refetch the full comment and pass it as `bodySnippet`; this clip keeps
+// pathological multi-MB comments from ballooning the extraction issue body.
+const MAX_COMMENT_BODY_CHARS = 8000;
+
 interface CommentCreatedPayload {
   identifier?: string;
   commentId?: string;
@@ -179,12 +186,17 @@ function hasFactBearingPatch(patch: Record<string, unknown> | undefined | null):
   return false;
 }
 
-function quote(snippet: string): string {
-  if (!snippet) return "(snippet unavailable — fetch the comment via ctx.issues.listComments)";
-  return snippet
+function quote(body: string): string {
+  if (!body) return "(comment body unavailable — fetch the comment via ctx.issues.listComments)";
+  return body
     .split("\n")
     .map((line) => `> ${line}`)
     .join("\n");
+}
+
+function clipForPrompt(body: string, max: number): { content: string; truncated: boolean } {
+  if (body.length <= max) return { content: body, truncated: false };
+  return { content: body.slice(0, max), truncated: true };
 }
 
 async function getQuipoRuntimeConfig(ctx: PluginContext) {
@@ -366,13 +378,18 @@ export async function enqueueCommentExtraction(
 
     const identifier = identifierHint ?? sourceIssue.identifier ?? sourceIssue.id;
     const titlePrefix = sourceKind === "backfill" ? "Quipo backfill" : "Quipo";
-    const snippetBlock = quote((bodySnippet ?? "").slice(0, 240));
+    const rawBody = bodySnippet ?? "";
+    const { content: clippedBody, truncated: bodyTruncated } = clipForPrompt(
+      rawBody,
+      MAX_COMMENT_BODY_CHARS,
+    );
+    const truncationNote = `(truncated to ${MAX_COMMENT_BODY_CHARS} chars; fetch the full comment via ctx.issues.listComments if needed.)`;
 
     // If the resolved extraction is still open, append the new comment to it
     // instead of opening a fresh ticket. The memory-worker re-reads the issue
-    // body on its next wake and harvests all batched snippets together.
+    // body on its next wake and harvests all batched comment bodies together.
     if (openExtractionIssueId) {
-      const appendBody = [
+      const appendParts: string[] = [
         `Additional comment on ${identifier} (batched into the same extraction):`,
         "",
         `- source issue: ${sourceIssue.id}`,
@@ -381,9 +398,13 @@ export async function enqueueCommentExtraction(
         authorAgentId ? `- author agent: ${authorAgentId}` : "- author: board user",
         `- source kind: ${sourceKind}`,
         "",
-        "Snippet:",
-        snippetBlock,
-      ].join("\n");
+        "Comment body:",
+        quote(clippedBody),
+      ];
+      if (bodyTruncated) {
+        appendParts.push("", truncationNote);
+      }
+      const appendBody = appendParts.join("\n");
 
       await ctx.issues.createComment(openExtractionIssueId, appendBody, companyId, {
         authorAgentId: authorAgentId ?? undefined,
@@ -420,7 +441,7 @@ export async function enqueueCommentExtraction(
       } as const;
     }
 
-    const description = [
+    const descriptionParts: string[] = [
       sourceKind === "backfill"
         ? `Extract atomic facts from an existing comment on ${identifier} (queued by RED-103 backfill).`
         : `Extract atomic facts from a new comment on ${identifier}.`,
@@ -431,11 +452,17 @@ export async function enqueueCommentExtraction(
       authorAgentId ? `- author agent: ${authorAgentId}` : "- author: board user",
       `- source kind: ${sourceKind}`,
       "",
-      "Snippet:",
-      snippetBlock,
+      "Comment body:",
+      quote(clippedBody),
+    ];
+    if (bodyTruncated) {
+      descriptionParts.push("", truncationNote);
+    }
+    descriptionParts.push(
       "",
       "Return your response as a single JSON object matching the memory-worker output contract.",
-    ].join("\n");
+    );
+    const description = descriptionParts.join("\n");
 
     const extractionIssue = await ctx.issues.create({
       companyId,
@@ -549,17 +576,44 @@ export async function onIssueCommentCreated(
     return;
   }
 
+  // The host-emitted `bodySnippet` is truncated to ~120 chars and routinely cuts
+  // mid-sentence, which makes the memory-worker return zero facts (RED-131).
+  // Refetch the full comment body and pass it through; fall back to the
+  // truncated snippet only if the fetch fails or the comment isn't found yet.
+  const fullBody = await fetchFullCommentBody(ctx, sourceIssue.id, event.companyId, commentId);
+  const bodyForPrompt = fullBody ?? payload.bodySnippet ?? null;
+
   await enqueueCommentExtraction(ctx, memoryAgentId, {
     companyId: event.companyId,
     sourceIssue,
     commentId,
-    bodySnippet: payload.bodySnippet ?? null,
+    bodySnippet: bodyForPrompt,
     identifierHint: payload.identifier ?? null,
     authorAgentId: payload.agentId ?? null,
     authorRunId: payload.runId ?? null,
     sourceKind: "comment",
     eventId: event.eventId,
   });
+}
+
+async function fetchFullCommentBody(
+  ctx: PluginContext,
+  sourceIssueId: string,
+  companyId: string,
+  commentId: string,
+): Promise<string | null> {
+  try {
+    const comments = await ctx.issues.listComments(sourceIssueId, companyId);
+    const found = comments.find((c) => c.id === commentId);
+    return found && typeof found.body === "string" && found.body.length > 0 ? found.body : null;
+  } catch (err) {
+    ctx.logger.warn("Quipo: failed to fetch full comment body — falling back to bodySnippet", {
+      sourceIssueId,
+      commentId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return null;
+  }
 }
 
 export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Promise<void> {
