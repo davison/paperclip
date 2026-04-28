@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import type { Issue } from "@paperclipai/shared";
+import type { Issue, IssueComment } from "@paperclipai/shared";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 
 import manifest from "../src/manifest.js";
@@ -229,6 +229,84 @@ describe("Quipo event handlers — issue.comment.created", () => {
     );
     const after = (await harness.ctx.issues.list({ companyId: COMPANY_ID })).length;
     expect(after).toBe(before);
+  });
+
+  // RED-131: the host-emitted bodySnippet is truncated to ~120 chars and cuts
+  // mid-sentence, which routinely returned `{"facts": []}` from the memory
+  // worker. The handler now refetches the full comment body before enqueueing.
+  it("RED-131: refetches the full comment body and embeds it in the extraction issue", async () => {
+    const commentId = randomUUID();
+    const fullBody =
+      "Quipo plugin uses pg_trgm for trigram search across stored facts. " +
+      "We picked pg_trgm over native LIKE because it handles fuzzy matches " +
+      "for technical terms (snake_case, kebab-case) without needing a " +
+      "separate full-text index. Latency is well under 50ms on the " +
+      "smoke-test corpus.";
+    const seededComment: IssueComment = {
+      id: commentId,
+      companyId: COMPANY_ID,
+      issueId: SOURCE_ISSUE_ID,
+      authorAgentId: OTHER_AGENT_ID,
+      authorUserId: null,
+      body: fullBody,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+    harness.seed({ issueComments: [seededComment] });
+
+    await emitCommentCreated(harness, { commentId });
+
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extraction = all.find((issue) => issue.originId === `comment:${commentId}`);
+    expect(extraction).toBeDefined();
+    expect(extraction!.description).toContain("Comment body:");
+    expect(extraction!.description).toContain("trigram search");
+    expect(extraction!.description).toContain("pg_trgm");
+    expect(extraction!.description).toContain("smoke-test corpus");
+    expect(extraction!.description).not.toContain("(truncated to");
+  });
+
+  it("RED-131: clips bodies over the embed cap and marks the prompt as truncated", async () => {
+    const commentId = randomUUID();
+    // 12,000 chars — well above the 8,000-char embed cap.
+    const fullBody = "x".repeat(12_000);
+    harness.seed({
+      issueComments: [
+        {
+          id: commentId,
+          companyId: COMPANY_ID,
+          issueId: SOURCE_ISSUE_ID,
+          authorAgentId: OTHER_AGENT_ID,
+          authorUserId: null,
+          body: fullBody,
+          createdAt: new Date(),
+          updatedAt: new Date(),
+        },
+      ],
+    });
+
+    await emitCommentCreated(harness, { commentId });
+
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extraction = all.find((issue) => issue.originId === `comment:${commentId}`);
+    expect(extraction).toBeDefined();
+    expect(extraction!.description).toContain("Comment body:");
+    expect(extraction!.description).toContain("(truncated to 8000 chars");
+    // Description must contain at least one full clipped chunk but not all 12,000 chars.
+    expect(extraction!.description.length).toBeLessThan(fullBody.length);
+  });
+
+  it("RED-131: falls back to the bodySnippet when listComments cannot resolve the comment", async () => {
+    // No comment seeded for this commentId — the harness returns an empty
+    // comment list, and the handler should fall back to payload.bodySnippet so
+    // we never queue an extraction with an empty body.
+    const { commentId } = await emitCommentCreated(harness);
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extraction = all.find((issue) => issue.originId === `comment:${commentId}`);
+    expect(extraction).toBeDefined();
+    expect(extraction!.description).toContain("Comment body:");
+    // bodySnippet from emitCommentCreated.
+    expect(extraction!.description).toContain("We agreed to use TypeScript everywhere");
   });
 });
 
