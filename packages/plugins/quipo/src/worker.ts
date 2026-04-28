@@ -1,10 +1,13 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
+import { registerQuipoEventHandlers } from "./event-handlers.js";
+
 const plugin = definePlugin({
   async setup(ctx) {
     ctx.logger.info("Quipo memory plugin started", {
       namespace: ctx.db.namespace,
     });
+    registerQuipoEventHandlers(ctx);
   },
 
   async onHealth() {
