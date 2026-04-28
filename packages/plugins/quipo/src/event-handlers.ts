@@ -41,9 +41,9 @@ function updateOriginId(sourceIssueId: string, updatedAt: Date | string): string
   return `update:${sourceIssueId}:${iso}`;
 }
 
-async function getMemoryAgentId(ctx: PluginContext): Promise<string | null> {
+async function getQuipoRuntimeConfig(ctx: PluginContext) {
   const raw = await ctx.config.get();
-  return readQuipoConfig(raw).memoryAgentId;
+  return readQuipoConfig(raw);
 }
 
 function isQuipoOriginated(originKind: unknown): boolean {
@@ -125,7 +125,14 @@ export async function onIssueCommentCreated(
     return;
   }
 
-  const memoryAgentId = await getMemoryAgentId(ctx);
+  const config = await getQuipoRuntimeConfig(ctx);
+  if (!config.enabled) {
+    ctx.logger.debug("Quipo: plugin disabled for this company — skipping comment extraction", {
+      commentId,
+    });
+    return;
+  }
+  const memoryAgentId = config.memoryAgentId;
   if (!memoryAgentId) {
     ctx.logger.warn("Quipo: memoryAgentId not configured — skipping comment extraction", {
       commentId,
@@ -233,7 +240,20 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
     return;
   }
 
-  const memoryAgentId = await getMemoryAgentId(ctx);
+  const config = await getQuipoRuntimeConfig(ctx);
+  if (!config.enabled) {
+    ctx.logger.debug("Quipo: plugin disabled for this company — skipping update extraction", {
+      sourceIssueId,
+    });
+    return;
+  }
+  if (config.extractionScope === "comments_only") {
+    ctx.logger.debug("Quipo: extractionScope=comments_only — skipping issue update", {
+      sourceIssueId,
+    });
+    return;
+  }
+  const memoryAgentId = config.memoryAgentId;
   if (!memoryAgentId) {
     ctx.logger.warn("Quipo: memoryAgentId not configured — skipping update extraction", {
       sourceIssueId,
