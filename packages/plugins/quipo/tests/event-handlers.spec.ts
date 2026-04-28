@@ -135,7 +135,7 @@ describe("Quipo event handlers — issue.comment.created", () => {
   it("creates an extraction issue assigned to the memory agent", async () => {
     const { commentId } = await emitCommentCreated(harness);
     const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
-    const extraction = all.find((issue) => issue.originId === commentId);
+    const extraction = all.find((issue) => issue.originId === `comment:${commentId}`);
     expect(extraction).toBeDefined();
     expect(extraction!.assigneeAgentId).toBe(MEMORY_AGENT_ID);
     expect(extraction!.projectId).toBe(PROJECT_ID);
@@ -150,7 +150,23 @@ describe("Quipo event handlers — issue.comment.created", () => {
     const { commentId } = await emitCommentCreated(harness);
     await emitCommentCreated(harness, { commentId });
     const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
-    const extractions = all.filter((issue) => issue.originId === commentId);
+    const extractions = all.filter((issue) => issue.originId === `comment:${commentId}`);
+    expect(extractions).toHaveLength(1);
+  });
+
+  it("is idempotent under concurrent delivery of the same comment", async () => {
+    // Two workers/processes can race the get→create→set sequence. Without an
+    // in-process claim lock + pre-create dedupe, each concurrent delivery
+    // would observe missing state and create its own extraction issue.
+    const commentId = randomUUID();
+    await Promise.all([
+      emitCommentCreated(harness, { commentId }),
+      emitCommentCreated(harness, { commentId }),
+      emitCommentCreated(harness, { commentId }),
+      emitCommentCreated(harness, { commentId }),
+    ]);
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all.filter((issue) => issue.originId === `comment:${commentId}`);
     expect(extractions).toHaveLength(1);
   });
 
@@ -205,9 +221,11 @@ describe("Quipo event handlers — issue.updated", () => {
   });
 
   it("creates an extraction issue when description or title changes", async () => {
-    const { eventId } = await emitIssueUpdated(harness, { patch: { description: "New body" } });
+    await emitIssueUpdated(harness, { patch: { description: "New body" } });
     const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
-    const extraction = all.find((issue) => issue.originId === `update:${SOURCE_ISSUE_ID}:${eventId}`);
+    const extraction = all.find((issue) =>
+      typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
     expect(extraction).toBeDefined();
     expect(extraction!.assigneeAgentId).toBe(MEMORY_AGENT_ID);
     expect(extraction!.title).toContain("RED-42");
@@ -226,7 +244,62 @@ describe("Quipo event handlers — issue.updated", () => {
     const { eventId } = await emitIssueUpdated(harness, { patch: { title: "Renamed" } });
     await emitIssueUpdated(harness, { eventId, patch: { title: "Renamed" } });
     const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
-    const extractions = all.filter((issue) => issue.originId === `update:${SOURCE_ISSUE_ID}:${eventId}`);
+    const extractions = all.filter((issue) =>
+      typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(extractions).toHaveLength(1);
+  });
+
+  it("is idempotent on at-least-once redelivery with a NEW eventId for the same logical update", async () => {
+    // Same source issue, same updatedAt, but the transport assigns different
+    // eventIds on each delivery. Idempotency must be keyed by (issueId, updatedAt),
+    // not by the transport eventId — otherwise we duplicate downstream work.
+    await emitIssueUpdated(harness, { patch: { title: "Renamed" } });
+    await emitIssueUpdated(harness, { patch: { title: "Renamed" } }); // fresh eventId
+    await emitIssueUpdated(harness, { patch: { title: "Renamed" } }); // fresh eventId
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all.filter((issue) =>
+      typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(extractions).toHaveLength(1);
+  });
+
+  it("re-extracts when the source issue is genuinely updated again (new updatedAt)", async () => {
+    // Sanity check the new key: a *new* logical update should produce a new
+    // extraction even though the source issue id is the same.
+    await emitIssueUpdated(harness, { patch: { title: "First rename" } });
+
+    // Re-seed the source issue with a later updatedAt to simulate a real
+    // subsequent edit on the board side.
+    const later = new Date(Date.now() + 60_000);
+    harness.seed({
+      issues: [makeIssue({ updatedAt: later, title: "Renamed again" })],
+    });
+
+    await emitIssueUpdated(harness, { patch: { title: "Renamed again" } });
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all.filter((issue) =>
+      typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(extractions).toHaveLength(2);
+  });
+
+  it("is idempotent under concurrent delivery of the same logical update", async () => {
+    // Fan-in: simulate the host delivering the same update concurrently to
+    // this worker. Without an in-process claim lock + pre-create dedupe,
+    // every concurrent delivery would observe missing state and create its
+    // own extraction issue.
+    const eventId = randomUUID();
+    await Promise.all([
+      emitIssueUpdated(harness, { eventId, patch: { description: "Bulk text" } }),
+      emitIssueUpdated(harness, { patch: { description: "Bulk text" } }),
+      emitIssueUpdated(harness, { patch: { description: "Bulk text" } }),
+      emitIssueUpdated(harness, { patch: { description: "Bulk text" } }),
+    ]);
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all.filter((issue) =>
+      typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
     expect(extractions).toHaveLength(1);
   });
 
