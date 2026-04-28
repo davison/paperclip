@@ -40,6 +40,44 @@ describe("quipo plugin manifest", () => {
     expect(manifest.capabilities).toContain("database.namespace.read");
     expect(manifest.capabilities).toContain("database.namespace.write");
   });
+
+  it("declares the per-company instanceConfigSchema for RED-102 settings", () => {
+    expect(manifest.instanceConfigSchema).toBeDefined();
+    const schema = manifest.instanceConfigSchema as {
+      type: string;
+      additionalProperties?: boolean;
+      properties: Record<string, { type: string; enum?: unknown[]; default?: unknown }>;
+    };
+    expect(schema.type).toBe("object");
+    expect(schema.additionalProperties).toBe(false);
+    expect(Object.keys(schema.properties).sort()).toEqual([
+      "enabled",
+      "extractionScope",
+      "memoryAgentId",
+    ]);
+    expect(schema.properties.enabled.type).toBe("boolean");
+    expect(schema.properties.enabled.default).toBe(false);
+    expect(schema.properties.memoryAgentId.type).toBe("string");
+    expect(schema.properties.extractionScope.type).toBe("string");
+    expect(schema.properties.extractionScope.enum).toEqual([
+      "comments_and_updates",
+      "comments_only",
+    ]);
+    expect(schema.properties.extractionScope.default).toBe("comments_and_updates");
+  });
+
+  it("declares metrics.write so RED-103 backfill can record completion counters", () => {
+    expect(manifest.capabilities).toContain("metrics.write");
+  });
+
+  it("registers the QuipoSettingsPage UI slot with instance.settings.register capability", () => {
+    expect(manifest.capabilities).toContain("instance.settings.register");
+    const slots = manifest.ui?.slots ?? [];
+    const settingsSlot = slots.find((slot) => slot.type === "settingsPage");
+    expect(settingsSlot).toBeDefined();
+    expect(settingsSlot?.exportName).toBe("QuipoSettingsPage");
+    expect(manifest.entrypoints?.ui).toBe("./dist/ui");
+  });
 });
 
 describe("quipo plugin migration 001_init_memory.sql", () => {

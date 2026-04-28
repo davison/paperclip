@@ -56,7 +56,9 @@ function makeIssue(overrides: Partial<Issue> = {}): Issue {
   return { ...base, ...overrides };
 }
 
-function makeHarness(config: Record<string, unknown> = { memoryAgentId: MEMORY_AGENT_ID }): TestHarness {
+function makeHarness(
+  config: Record<string, unknown> = { enabled: true, memoryAgentId: MEMORY_AGENT_ID },
+): TestHarness {
   const harness = createTestHarness({ manifest, config });
   registerQuipoEventHandlers(harness.ctx);
   harness.seed({
@@ -171,7 +173,7 @@ describe("Quipo event handlers — issue.comment.created", () => {
   });
 
   it("skips when memoryAgentId is not configured", async () => {
-    const blankHarness = createTestHarness({ manifest, config: {} });
+    const blankHarness = createTestHarness({ manifest, config: { enabled: true } });
     registerQuipoEventHandlers(blankHarness.ctx);
     blankHarness.seed({ issues: [makeIssue()] });
     const before = (await blankHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
@@ -179,6 +181,22 @@ describe("Quipo event handlers — issue.comment.created", () => {
     const after = (await blankHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
     expect(after).toBe(before);
     expect(blankHarness.logs.some((entry) => entry.message.includes("memoryAgentId not configured"))).toBe(true);
+  });
+
+  it("skips when the company has Quipo disabled (default)", async () => {
+    const disabledHarness = createTestHarness({
+      manifest,
+      config: { memoryAgentId: MEMORY_AGENT_ID },
+    });
+    registerQuipoEventHandlers(disabledHarness.ctx);
+    disabledHarness.seed({ issues: [makeIssue()] });
+    const before = (await disabledHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
+    await emitCommentCreated(disabledHarness);
+    const after = (await disabledHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
+    expect(after).toBe(before);
+    expect(
+      disabledHarness.logs.some((entry) => entry.message.includes("plugin disabled for this company")),
+    ).toBe(true);
   });
 
   it("skips comments authored by the memory agent itself (no recursion)", async () => {
@@ -324,12 +342,50 @@ describe("Quipo event handlers — issue.updated", () => {
   });
 
   it("skips when memoryAgentId is not configured", async () => {
-    const blankHarness = createTestHarness({ manifest, config: {} });
+    const blankHarness = createTestHarness({ manifest, config: { enabled: true } });
     registerQuipoEventHandlers(blankHarness.ctx);
     blankHarness.seed({ issues: [makeIssue()] });
     const before = (await blankHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
     await emitIssueUpdated(blankHarness, { patch: { title: "Renamed" } });
     const after = (await blankHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
     expect(after).toBe(before);
+  });
+
+  it("skips when the company has Quipo disabled (default)", async () => {
+    const disabledHarness = createTestHarness({
+      manifest,
+      config: { memoryAgentId: MEMORY_AGENT_ID },
+    });
+    registerQuipoEventHandlers(disabledHarness.ctx);
+    disabledHarness.seed({ issues: [makeIssue()] });
+    const before = (await disabledHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
+    await emitIssueUpdated(disabledHarness, { patch: { title: "Renamed" } });
+    const after = (await disabledHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
+    expect(after).toBe(before);
+    expect(
+      disabledHarness.logs.some((entry) => entry.message.includes("plugin disabled for this company")),
+    ).toBe(true);
+  });
+
+  it("skips when extractionScope is comments_only", async () => {
+    const commentsOnlyHarness = createTestHarness({
+      manifest,
+      config: {
+        enabled: true,
+        memoryAgentId: MEMORY_AGENT_ID,
+        extractionScope: "comments_only",
+      },
+    });
+    registerQuipoEventHandlers(commentsOnlyHarness.ctx);
+    commentsOnlyHarness.seed({ issues: [makeIssue()] });
+    const before = (await commentsOnlyHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
+    await emitIssueUpdated(commentsOnlyHarness, { patch: { title: "Renamed" } });
+    const after = (await commentsOnlyHarness.ctx.issues.list({ companyId: COMPANY_ID })).length;
+    expect(after).toBe(before);
+    expect(
+      commentsOnlyHarness.logs.some((entry) =>
+        entry.message.includes("extractionScope=comments_only"),
+      ),
+    ).toBe(true);
   });
 });
