@@ -66,6 +66,10 @@ describe("quipo plugin manifest", () => {
     expect(schema.properties.extractionScope.default).toBe("comments_and_updates");
   });
 
+  it("declares metrics.write so RED-103 backfill can record completion counters", () => {
+    expect(manifest.capabilities).toContain("metrics.write");
+  });
+
   it("registers the QuipoSettingsPage UI slot with instance.settings.register capability", () => {
     expect(manifest.capabilities).toContain("instance.settings.register");
     const slots = manifest.ui?.slots ?? [];

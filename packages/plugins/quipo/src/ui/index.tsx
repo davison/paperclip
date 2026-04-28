@@ -1,10 +1,15 @@
 import { useCallback, useEffect, useMemo, useState, type CSSProperties, type FormEvent } from "react";
 import {
   useHostContext,
+  usePluginAction,
   type PluginSettingsPageProps,
 } from "@paperclipai/plugin-sdk/ui";
 
 import { QUIPO_PLUGIN_ID } from "../config.js";
+
+// Action key registered by the worker (see src/backfill.ts). Inlined here to
+// keep the browser bundle from pulling worker-only modules.
+const QUIPO_BACKFILL_ACTION_KEY = "backfill";
 
 const QUIPO_DEFAULTS = {
   enabled: false,
@@ -382,7 +387,99 @@ export function QuipoSettingsPage(_props: PluginSettingsPageProps) {
         </button>
         {savedAt ? <span style={successStyle}>Saved · {new Date(savedAt).toLocaleTimeString()}</span> : null}
       </div>
+
+      <BackfillCard companyId={companyId} memoryAgentConfigured={form.memoryAgentId.trim().length > 0} />
     </form>
+  );
+}
+
+interface BackfillSummaryView {
+  ok?: boolean;
+  reason?: string;
+  issuesScanned?: number;
+  commentsScanned?: number;
+  queued?: number;
+  alreadyExtracted?: number;
+  memoryAgentAuthoredSkipped?: number;
+  pluginOwnedIssuesSkipped?: number;
+  truncated?: boolean;
+  dryRun?: boolean;
+}
+
+function BackfillCard({
+  companyId,
+  memoryAgentConfigured,
+}: {
+  companyId: string | null | undefined;
+  memoryAgentConfigured: boolean;
+}) {
+  const runBackfillAction = usePluginAction(QUIPO_BACKFILL_ACTION_KEY);
+  const [running, setRunning] = useState<"dry" | "real" | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<BackfillSummaryView | null>(null);
+
+  async function trigger(dryRun: boolean) {
+    if (!companyId) {
+      setError("No active company. Pick a company before running backfill.");
+      return;
+    }
+    setError(null);
+    setRunning(dryRun ? "dry" : "real");
+    try {
+      const summary = (await runBackfillAction({ companyId, dryRun })) as BackfillSummaryView;
+      setResult(summary);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setRunning(null);
+    }
+  }
+
+  return (
+    <div style={cardStyle}>
+      <div style={fieldStyle}>
+        <strong>One-shot backfill</strong>
+        <span style={helpTextStyle}>
+          Walks every existing issue in this company and queues the configured Memory Agent to
+          extract facts from each comment. Idempotent — already-processed comments are skipped via
+          their <code>source_comment_id</code>. The action does <em>not</em> require the master
+          switch to be on, so you can seed memory before flipping ingestion live.
+        </span>
+        <div style={rowStyle}>
+          <button
+            type="button"
+            style={buttonStyle}
+            disabled={!memoryAgentConfigured || running !== null}
+            onClick={() => trigger(true)}
+            data-testid="quipo-backfill-dryrun"
+          >
+            {running === "dry" ? "Scanning…" : "Dry run (scan only)"}
+          </button>
+          <button
+            type="button"
+            style={primaryButtonStyle}
+            disabled={!memoryAgentConfigured || running !== null}
+            onClick={() => trigger(false)}
+            data-testid="quipo-backfill-run"
+          >
+            {running === "real" ? "Running…" : "Run backfill now"}
+          </button>
+          {!memoryAgentConfigured ? (
+            <span style={helpTextStyle}>Configure a Memory Agent above to enable backfill.</span>
+          ) : null}
+        </div>
+        {error ? <div style={errorStyle}>{error}</div> : null}
+        {result ? (
+          <div style={helpTextStyle}>
+            {result.dryRun ? "Dry run · " : "Backfill · "}
+            queued {result.queued ?? 0}, already-extracted {result.alreadyExtracted ?? 0}, scanned{" "}
+            {result.commentsScanned ?? 0} comments across {result.issuesScanned ?? 0} issues
+            {result.truncated ? " (truncated; raise the cap to scan more)" : ""}.
+            {result.reason ? ` Reason: ${result.reason}.` : ""}
+          </div>
+        ) : null}
+      </div>
+    </div>
   );
 }
 

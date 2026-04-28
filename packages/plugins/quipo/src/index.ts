@@ -45,4 +45,12 @@ export type {
   ToolReturn,
 } from "./tools/index.js";
 
+export {
+  QUIPO_BACKFILL_ACTION_KEY,
+  registerQuipoBackfillAction,
+  runBackfill,
+} from "./backfill.js";
+
+export type { BackfillParams, BackfillSummary } from "./backfill.js";
+
 export { default as manifest } from "./manifest.js";
