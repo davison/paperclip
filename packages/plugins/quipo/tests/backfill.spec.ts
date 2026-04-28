@@ -402,6 +402,79 @@ describe("Quipo backfill — caps and dryRun", () => {
     expect(result.truncated).toBe(true);
   });
 
+  it("maxIssues caps eligible source issues, not raw rows that include plugin-owned items", async () => {
+    // Three eligible source issues + a leading plugin-owned issue. With a cap
+    // of 2 raw rows the old code would have stopped after [pluginOwned, ISSUE_A]
+    // and only scanned ISSUE_A. The cap must instead bind on eligible issues so
+    // ISSUE_A and ISSUE_B are both scanned and the third one trips truncation.
+    const harness = createTestHarness({
+      manifest,
+      config: { enabled: true, memoryAgentId: MEMORY_AGENT_ID },
+    });
+    registerQuipoBackfillAction(harness.ctx);
+    const ISSUE_C = "00000000-0000-0000-0000-000000000444";
+    const issuePlugin = makeIssue({
+      id: ISSUE_PLUGIN,
+      identifier: "RED-PL",
+      originKind: `plugin:${manifest.id}`,
+    });
+    const issueA = makeIssue({ id: ISSUE_A, identifier: "RED-A" });
+    const issueB = makeIssue({ id: ISSUE_B, identifier: "RED-B" });
+    const issueC = makeIssue({ id: ISSUE_C, identifier: "RED-C" });
+    const cA = makeComment({ id: randomUUID(), issueId: ISSUE_A });
+    const cB = makeComment({ id: randomUUID(), issueId: ISSUE_B });
+    const cC = makeComment({ id: randomUUID(), issueId: ISSUE_C });
+    harness.seed({
+      // Plugin-owned issue first so a raw-cap implementation would burn one
+      // of the two cap slots on something we always skip.
+      issues: [issuePlugin, issueA, issueB, issueC],
+      issueComments: [cA, cB, cC],
+    });
+
+    const result = await runBackfill(harness.ctx, { companyId: COMPANY_ID, maxIssues: 2 });
+
+    expect(result.ok).toBe(true);
+    expect(result.issuesScanned).toBe(2);
+    expect(result.pluginOwnedIssuesSkipped).toBe(1);
+    expect(result.queued).toBe(2);
+    expect(result.truncated).toBe(true);
+  });
+
+  it("returns the computed summary even when ctx.metrics.write fails", async () => {
+    // Telemetry failures must not invalidate already-completed extraction
+    // work — the action should log and return ok=true with the real counts.
+    const harness = makeHarness();
+    const comment = makeComment({ id: randomUUID(), issueId: ISSUE_A });
+    harness.seed({ issueComments: [comment] });
+
+    const originalWrite = harness.ctx.metrics.write;
+    let metricsCallCount = 0;
+    harness.ctx.metrics.write = async (..._args: Parameters<typeof originalWrite>) => {
+      metricsCallCount += 1;
+      throw new Error("metrics backend unavailable");
+    };
+
+    try {
+      const result = await runBackfill(harness.ctx, { companyId: COMPANY_ID });
+      expect(result.ok).toBe(true);
+      expect(result.queued).toBe(1);
+      // Both metric calls must have been attempted and isolated; neither one
+      // is allowed to short-circuit the other or the summary return.
+      expect(metricsCallCount).toBe(2);
+
+      const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+      const extractions = all.filter(
+        (issue) =>
+          issue.originKind === `plugin:${manifest.id}` &&
+          typeof issue.originId === "string" &&
+          issue.originId.startsWith("comment:"),
+      );
+      expect(extractions).toHaveLength(1);
+    } finally {
+      harness.ctx.metrics.write = originalWrite;
+    }
+  });
+
   it("dryRun does not create extraction issues but counts what would be queued", async () => {
     const harness = makeHarness();
     const comments = [

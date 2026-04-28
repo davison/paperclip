@@ -105,56 +105,96 @@ function readBackfillParams(raw: Record<string, unknown> | undefined | null): Ba
   return params;
 }
 
+interface FetchIssuesResult {
+  issues: Issue[];
+  truncated: boolean;
+  /** Plugin-owned issues observed during scope resolution and dropped client-side. */
+  pluginOwnedSkipped: number;
+  reason?: BackfillSummary["reason"];
+}
+
 async function fetchIssuesInScope(
   ctx: PluginContext,
   params: BackfillParams,
-): Promise<{ issues: Issue[]; truncated: boolean; reason?: BackfillSummary["reason"] }> {
+): Promise<FetchIssuesResult> {
   if (params.issueId) {
     // ctx.issues.get enforces company isolation host-side, so a foreign-company
     // issueId comes back as null and is reported as out-of-scope.
     const issue = await ctx.issues.get(params.issueId, params.companyId);
     if (!issue) {
-      return { issues: [], truncated: false, reason: "no_issues_in_scope" };
+      return { issues: [], truncated: false, pluginOwnedSkipped: 0, reason: "no_issues_in_scope" };
     }
     if (params.projectId && issue.projectId !== params.projectId) {
-      return { issues: [], truncated: false, reason: "no_issues_in_scope" };
+      return { issues: [], truncated: false, pluginOwnedSkipped: 0, reason: "no_issues_in_scope" };
     }
-    return { issues: [issue], truncated: false };
+    if (isQuipoOriginatedIssue(issue.originKind)) {
+      // Honour explicit single-issue requests but report the skip; backfill
+      // never queues against plugin-owned issues.
+      return {
+        issues: [],
+        truncated: false,
+        pluginOwnedSkipped: 1,
+        reason: "no_issues_in_scope",
+      };
+    }
+    return { issues: [issue], truncated: false, pluginOwnedSkipped: 0 };
   }
 
   const collected: Issue[] = [];
+  let pluginOwnedSkipped = 0;
   const cap = params.maxIssues ?? DEFAULT_MAX_ISSUES;
   let offset = 0;
   let truncated = false;
-  // Walk the issues list one page at a time so very large companies don't
-  // pull a 10k-row response in a single host call. We still respect the
-  // user-supplied cap via `cap` and fall through if the page is short.
+  // The cap models *eligible source issues* — not raw rows. Plugin-owned
+  // issues from prior runs are filtered per page so dense plugin-issue
+  // populations near the front of the listing cannot silently shrink the
+  // operator's effective scan window.
   while (collected.length < cap) {
-    const remaining = cap - collected.length;
-    const limit = Math.min(ISSUE_PAGE_SIZE, remaining);
     const page = await ctx.issues.list({
       companyId: params.companyId,
       projectId: params.projectId ?? undefined,
-      limit,
+      limit: ISSUE_PAGE_SIZE,
       offset,
     });
     if (page.length === 0) break;
-    collected.push(...page);
     offset += page.length;
-    if (page.length < limit) break;
+
+    let stopAtCap = false;
+    for (const issue of page) {
+      if (isQuipoOriginatedIssue(issue.originKind)) {
+        pluginOwnedSkipped += 1;
+        continue;
+      }
+      if (collected.length >= cap) {
+        // We hit the eligible-issue cap mid-page — flag truncation and stop
+        // collecting; we still let the loop count remaining plugin rows in
+        // this page so pluginOwnedIssuesSkipped stays accurate.
+        stopAtCap = true;
+        truncated = true;
+        break;
+      }
+      collected.push(issue);
+    }
+
+    if (stopAtCap) break;
+    if (page.length < ISSUE_PAGE_SIZE) break;
   }
-  // Probe for "is there more?" so we can flag the cap was binding without
-  // pulling another full page.
-  if (collected.length === cap) {
+  // Probe one page beyond the last offset for any remaining *eligible* issue.
+  // This lets us flag truncation when the cap exactly matches the total but
+  // there is still more to scan, without defeating the cap's intent.
+  if (collected.length === cap && !truncated) {
     const overflow = await ctx.issues.list({
       companyId: params.companyId,
       projectId: params.projectId ?? undefined,
-      limit: 1,
-      offset: cap,
+      limit: ISSUE_PAGE_SIZE,
+      offset,
     });
-    if (overflow.length > 0) truncated = true;
+    const moreEligible = overflow.some(
+      (candidate) => !isQuipoOriginatedIssue(candidate.originKind),
+    );
+    if (moreEligible) truncated = true;
   }
-  return { issues: collected, truncated };
+  return { issues: collected, truncated, pluginOwnedSkipped };
 }
 
 function getCommentBodySnippet(comment: IssueComment): string | null {
@@ -201,7 +241,8 @@ export async function runBackfill(
     return summary;
   }
 
-  const { issues, truncated, reason } = await fetchIssuesInScope(ctx, params);
+  const { issues, truncated, pluginOwnedSkipped, reason } = await fetchIssuesInScope(ctx, params);
+  summary.pluginOwnedIssuesSkipped = pluginOwnedSkipped;
   if (issues.length === 0) {
     summary.reason = reason ?? "no_issues_in_scope";
     summary.ok = true;
@@ -215,10 +256,12 @@ export async function runBackfill(
   summary.truncated = truncated;
 
   for (const issue of issues) {
-    if (isQuipoOriginatedIssue(issue.originKind)) {
-      summary.pluginOwnedIssuesSkipped += 1;
-      continue;
-    }
+    // Defence-in-depth: fetchIssuesInScope already filters plugin-owned issues
+    // and counts them against pluginOwnedIssuesSkipped, so this branch is
+    // unreachable in practice. We keep the guard so a future change to the
+    // fetch path cannot accidentally start enqueueing extractions against the
+    // plugin's own output.
+    if (isQuipoOriginatedIssue(issue.originKind)) continue;
     summary.issuesScanned += 1;
 
     let comments: IssueComment[];
@@ -326,12 +369,32 @@ export async function runBackfill(
     truncated: summary.truncated,
     dryRun: summary.dryRun,
   });
-  await ctx.metrics.write("backfill.completed", 1, {
-    dry_run: summary.dryRun ? "true" : "false",
-  });
-  await ctx.metrics.write("backfill.queued_extractions", summary.queued, {
-    dry_run: summary.dryRun ? "true" : "false",
-  });
+  // Telemetry must never invalidate already-completed extraction work. A
+  // transient metrics-backend failure used to throw out of `runBackfill` here,
+  // which made operators see a "failed" backfill even though every extraction
+  // issue had been created successfully and would not be re-queued on retry.
+  // Isolate metrics writes so the core summary is what we return.
+  try {
+    await ctx.metrics.write("backfill.completed", 1, {
+      dry_run: summary.dryRun ? "true" : "false",
+    });
+  } catch (err) {
+    ctx.logger.warn("Quipo backfill: metrics write 'backfill.completed' failed — continuing", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+  try {
+    await ctx.metrics.write("backfill.queued_extractions", summary.queued, {
+      dry_run: summary.dryRun ? "true" : "false",
+    });
+  } catch (err) {
+    ctx.logger.warn(
+      "Quipo backfill: metrics write 'backfill.queued_extractions' failed — continuing",
+      {
+        error: err instanceof Error ? err.message : String(err),
+      },
+    );
+  }
   return summary;
 }
 
