@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { Issue } from "@paperclipai/shared";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
@@ -385,6 +385,78 @@ describe("Quipo event handlers — issue.updated", () => {
     expect(
       commentsOnlyHarness.logs.some((entry) =>
         entry.message.includes("extractionScope=comments_only"),
+      ),
+    ).toBe(true);
+  });
+});
+
+describe("Quipo event handlers — wake memory agent (RED-133)", () => {
+  let harness: TestHarness;
+  beforeEach(() => {
+    harness = makeHarness();
+  });
+
+  it("wakes the memory agent on the freshly-created extraction issue after a comment", async () => {
+    const wakeSpy = vi.spyOn(harness.ctx.issues, "requestWakeup");
+    const { commentId } = await emitCommentCreated(harness);
+
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extraction = all.find((issue) => issue.originId === `comment:${commentId}`);
+    expect(extraction).toBeDefined();
+
+    expect(wakeSpy).toHaveBeenCalledTimes(1);
+    expect(wakeSpy).toHaveBeenCalledWith(
+      extraction!.id,
+      COMPANY_ID,
+      expect.objectContaining({
+        reason: expect.stringContaining("RED-42"),
+        contextSource: `plugin:${manifest.id}`,
+        idempotencyKey: `quipo:wake:${extraction!.id}`,
+      }),
+    );
+  });
+
+  it("wakes the memory agent on the freshly-created extraction issue after an issue update", async () => {
+    const wakeSpy = vi.spyOn(harness.ctx.issues, "requestWakeup");
+    await emitIssueUpdated(harness, { patch: { title: "Renamed" } });
+
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extraction = all.find((issue) =>
+      typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(extraction).toBeDefined();
+
+    expect(wakeSpy).toHaveBeenCalledTimes(1);
+    expect(wakeSpy).toHaveBeenCalledWith(
+      extraction!.id,
+      COMPANY_ID,
+      expect.objectContaining({
+        reason: expect.stringContaining("RED-42"),
+        contextSource: `plugin:${manifest.id}`,
+        idempotencyKey: `quipo:wake:${extraction!.id}`,
+      }),
+    );
+  });
+
+  it("does not wake when the comment extraction is short-circuited by idempotency", async () => {
+    const { commentId } = await emitCommentCreated(harness);
+    const wakeSpy = vi.spyOn(harness.ctx.issues, "requestWakeup");
+    await emitCommentCreated(harness, { commentId });
+    expect(wakeSpy).not.toHaveBeenCalled();
+  });
+
+  it("does not surface wake failures as event-handler errors (extraction issue still exists)", async () => {
+    const wakeSpy = vi
+      .spyOn(harness.ctx.issues, "requestWakeup")
+      .mockRejectedValueOnce(new Error("wake transport down"));
+
+    await expect(emitCommentCreated(harness)).resolves.toBeDefined();
+
+    expect(wakeSpy).toHaveBeenCalledTimes(1);
+    expect(
+      harness.logs.some(
+        (entry) =>
+          entry.level === "warn" && entry.message.includes("failed to wake memory agent"),
       ),
     ).toBe(true);
   });
