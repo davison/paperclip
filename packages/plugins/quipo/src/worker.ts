@@ -1,6 +1,7 @@
 import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 
 import { registerQuipoEventHandlers } from "./event-handlers.js";
+import { registerQuipoTools } from "./tools/index.js";
 
 const plugin = definePlugin({
   async setup(ctx) {
@@ -8,6 +9,7 @@ const plugin = definePlugin({
       namespace: ctx.db.namespace,
     });
     registerQuipoEventHandlers(ctx);
+    registerQuipoTools(ctx);
   },
 
   async onHealth() {

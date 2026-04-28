@@ -27,4 +27,22 @@ export { MEMORY_WORKER_AGENT_TEMPLATE } from "./agent-templates/memory-worker/te
 
 export type { MemoryWorkerAgentTemplate } from "./agent-templates/memory-worker/template.js";
 
+export {
+  QUIPO_TOOL_NAMES,
+  QUIPO_TOOL_DECLARATIONS,
+  registerQuipoTools,
+  runMemorySearch,
+  runMemorySearchConclusions,
+  runMemoryGetIssueContext,
+  runMemoryGetPeerContext,
+  runMemoryAskPeer,
+} from "./tools/index.js";
+
+export type {
+  MemoryDb,
+  AgentInvoker,
+  ToolRun,
+  ToolReturn,
+} from "./tools/index.js";
+
 export { default as manifest } from "./manifest.js";
