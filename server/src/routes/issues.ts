@@ -953,10 +953,8 @@ export function issueRoutes(
     }
     const offset = parsedOffset ?? 0;
 
-    // RED-177: `includeHidden` surfaces issues that are deliberately hidden
-    // from default lists (e.g. Quipo memory-extraction tickets that contain
-    // copied comment snippets). Restrict to instance admins so hidden issues
-    // remain non-enumerable from standard listing API access.
+    // Hidden issues (e.g. Quipo memory-extraction tickets) may contain
+    // copied user content; only instance admins can enumerate them (RED-177).
     const includeHiddenRequested =
       req.query.includeHidden === "true" || req.query.includeHidden === "1";
     if (includeHiddenRequested) {
