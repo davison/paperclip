@@ -108,6 +108,19 @@
         ]
       },
       {
+        "tab": "Plugins",
+        "groups": [
+          {
+            "group": "Quipo (cross-issue memory)",
+            "pages": [
+              "plugins/quipo/index",
+              "plugins/quipo/lifecycle",
+              "plugins/quipo/tools/index"
+            ]
+          }
+        ]
+      },
+      {
         "tab": "API Reference",
         "groups": [
           {
