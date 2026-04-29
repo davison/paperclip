@@ -533,4 +533,30 @@ describe("Quipo memory-worker comment — extraction-issue closure (RED-162)", (
     expect(reason).toBeDefined();
     expect(reason!.body).toContain("could not be parsed");
   });
+
+  it("does not close the extraction issue as done on redelivery of the same parse_error comment (RED-166)", async () => {
+    // First delivery of malformed JSON: harvest stores parse_error state for
+    // this commentId and leaves the issue open for retry.
+    const garbage = makeReplyComment({ body: "definitely not json" });
+    harness.seed({ issueComments: [garbage] });
+    await emitWorkerReply(garbage);
+
+    let issue = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(issue!.status).not.toBe("done");
+
+    // Redelivery of the exact same commentId. harvestExtraction's idempotency
+    // key hits the prior parse_error state. This must NOT surface as
+    // `already_harvested` (which would close the issue as `done` with zero
+    // successful harvest); the redelivery still represents a parse failure.
+    await emitWorkerReply(garbage);
+
+    issue = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(issue!.status).not.toBe("done");
+
+    // No facts persisted by either delivery.
+    const factInserts = harness.dbExecutes.filter((e) =>
+      /INSERT INTO .*\.facts/.test(e.sql),
+    );
+    expect(factInserts).toHaveLength(0);
+  });
 });

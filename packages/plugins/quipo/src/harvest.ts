@@ -94,8 +94,24 @@ export async function harvestExtraction(
   const { companyId, commentBody, commentId, extractionIssueId, link } = input;
 
   const stateKey = harvestStateKey(commentId);
-  const existing = await ctx.state.get(stateKey);
+  const existing = (await ctx.state.get(stateKey)) as
+    | { outcome?: string; detail?: string }
+    | null
+    | undefined;
   if (existing) {
+    // Re-surface the original outcome on redelivery so callers can route
+    // the same way as the first attempt. A prior `parse_error` must NOT be
+    // reported as `already_harvested` — that would let the caller close the
+    // extraction issue as `done` despite zero successful harvest (RED-166).
+    if (existing.outcome === "parse_error") {
+      ctx.logger.debug("Quipo: prior parse_error replayed for comment", { commentId });
+      return {
+        status: "parse_error",
+        factsInserted: 0,
+        totalFactsInResponse: 0,
+        parseError: existing.detail,
+      };
+    }
     ctx.logger.debug("Quipo: harvest already recorded for comment", { commentId });
     return { status: "already_harvested", factsInserted: 0, totalFactsInResponse: 0 };
   }
