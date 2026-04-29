@@ -559,4 +559,43 @@ describe("Quipo memory-worker comment — extraction-issue closure (RED-162)", (
     );
     expect(factInserts).toHaveLength(0);
   });
+
+  it("does not advance the parse-error retry counter when the same parse_error commentId is redelivered (RED-166 dedupe)", async () => {
+    // First delivery of malformed JSON: counter goes to 1, issue stays open.
+    const garbage = makeReplyComment({ body: "definitely not json" });
+    harness.seed({ issueComments: [garbage] });
+    await emitWorkerReply(garbage);
+
+    let issue = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(issue!.status).not.toBe("blocked");
+    expect(issue!.status).not.toBe("done");
+
+    // Redelivery of the same commentId (at-least-once event bus). Without
+    // the per-commentId dedupe, this would push the counter to MAX (=2) and
+    // wrongly mark the extraction issue `blocked` even though no new worker
+    // attempt has happened.
+    await emitWorkerReply(garbage);
+
+    issue = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(issue!.status).not.toBe("blocked");
+
+    // No reason comment posted yet — the block path must not have fired.
+    const allComments = await harness.ctx.issues.listComments(extractionIssueId, COMPANY_ID);
+    const reason = allComments.find(
+      (c) =>
+        c.authorAgentId === MEMORY_AGENT_ID &&
+        c.body.includes("Quipo: extraction blocked"),
+    );
+    expect(reason).toBeUndefined();
+
+    // A *new* malformed comment must still advance the counter and trigger
+    // the block path — confirming the dedupe is per-commentId, not a global
+    // increment freeze.
+    const garbage2 = makeReplyComment({ body: "still not json {{" });
+    harness.seed({ issueComments: [garbage, garbage2] });
+    await emitWorkerReply(garbage2);
+
+    issue = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(issue!.status).toBe("blocked");
+  });
 });
