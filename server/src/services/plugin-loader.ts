@@ -1708,6 +1708,11 @@ export function pluginLoader(
       const workerEntrypoint = resolveWorkerEntrypoint(plugin, localPluginDir);
       const packageRoot = resolvePluginPackageRoot(plugin, localPluginDir);
 
+      // Diagnostic: warn if on-disk manifest capabilities differ from the
+      // DB-stored manifest_json. Non-fatal — activation proceeds with the
+      // DB-stored manifest regardless.
+      await warnIfManifestCapabilityDrift(plugin, packageRoot, log);
+
       // ------------------------------------------------------------------
       // 2. Apply restricted database migrations before worker startup
       // ------------------------------------------------------------------
@@ -1955,6 +1960,97 @@ function resolveWorkerEntrypoint(
       `Checked: ${path.resolve(packageDir, workerRelPath)}, ` +
       `${path.resolve(directDir, workerRelPath)}`,
   );
+}
+
+/**
+ * Compare the on-disk manifest's capabilities to the DB-stored
+ * `manifest_json.capabilities` and emit a warning when they diverge.
+ *
+ * Capability drift indicates the on-disk plugin build has been updated
+ * (new tools, removed capabilities, etc.) but the registry has not been
+ * upgraded to reflect those changes — so the host activates the plugin
+ * with stale capability validators. This warning surfaces the mismatch
+ * at startup so operators know to run `upgrade` (or reinstall) before
+ * relying on the new capabilities.
+ *
+ * Failures to read or parse the on-disk manifest are non-fatal — the
+ * primary activation path still uses the DB manifest. We log at debug
+ * level for diagnostics and continue.
+ */
+interface CapabilityDriftLogger {
+  warn(...args: unknown[]): void;
+  debug(...args: unknown[]): void;
+}
+
+async function warnIfManifestCapabilityDrift(
+  plugin: PluginRecord,
+  packageRoot: string,
+  log: CapabilityDriftLogger,
+): Promise<void> {
+  try {
+    const pkgJson = await readPackageJson(packageRoot);
+    if (!pkgJson) return;
+    const manifestPath = resolveManifestPath(packageRoot, pkgJson);
+    if (!manifestPath || !existsSync(manifestPath)) return;
+
+    let onDiskRaw: unknown;
+    try {
+      const mod = (await import(manifestPath)) as Record<string, unknown>;
+      onDiskRaw = mod["default"] ?? mod;
+    } catch (err) {
+      log.debug(
+        {
+          pluginId: plugin.id,
+          manifestPath,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "plugin-loader: capability-drift check skipped (failed to import on-disk manifest)",
+      );
+      return;
+    }
+
+    const onDiskCaps = extractCapabilityList(onDiskRaw);
+    if (onDiskCaps === null) return;
+
+    const dbManifest = plugin.manifestJson as PaperclipPluginManifestV1 | null;
+    const dbCaps = dbManifest ? extractCapabilityList(dbManifest) ?? [] : [];
+
+    const dbSet = new Set(dbCaps);
+    const onDiskSet = new Set(onDiskCaps);
+    const onlyInDb = dbCaps.filter((c) => !onDiskSet.has(c)).sort();
+    const onlyOnDisk = onDiskCaps.filter((c) => !dbSet.has(c)).sort();
+
+    if (onlyInDb.length === 0 && onlyOnDisk.length === 0) return;
+
+    log.warn(
+      {
+        pluginId: plugin.id,
+        pluginKey: plugin.pluginKey,
+        manifestPath,
+        capabilitiesOnlyInDb: onlyInDb,
+        capabilitiesOnlyOnDisk: onlyOnDisk,
+        dbCapabilities: [...dbSet].sort(),
+        onDiskCapabilities: [...onDiskSet].sort(),
+      },
+      "plugin-loader: on-disk manifest capabilities differ from DB-stored manifest. " +
+        "Activation continues with the DB-stored manifest; run a plugin upgrade to apply on-disk changes.",
+    );
+  } catch (err) {
+    log.debug(
+      {
+        pluginId: plugin.id,
+        err: err instanceof Error ? err.message : String(err),
+      },
+      "plugin-loader: capability-drift check failed",
+    );
+  }
+}
+
+function extractCapabilityList(raw: unknown): string[] | null {
+  if (!raw || typeof raw !== "object") return null;
+  const caps = (raw as Record<string, unknown>)["capabilities"];
+  if (!Array.isArray(caps)) return null;
+  return caps.filter((c): c is string => typeof c === "string");
 }
 
 function resolvePluginPackageRoot(

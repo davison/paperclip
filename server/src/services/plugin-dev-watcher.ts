@@ -153,6 +153,44 @@ export function resolvePluginWatchTargets(
 }
 
 /**
+ * Resolve the absolute path of a plugin's manifest entrypoint from its
+ * package.json `paperclipPlugin.manifest` field. Returns null if the field is
+ * missing, the file does not exist, or the entry resolves to a directory.
+ *
+ * Watchers use this to distinguish a manifest-file change (which requires a
+ * full plugin re-activation so host-side capability validators, tool
+ * registrations, event subscriptions, jobs, and webhooks are rebuilt) from a
+ * worker/UI change (where a worker restart is sufficient).
+ */
+export function resolvePluginManifestEntry(
+  packagePath: string,
+  fsDeps?: Pick<PluginDevWatcherFsDeps, "existsSync" | "readFileSync" | "statSync">,
+): string | null {
+  const fileExists = fsDeps?.existsSync ?? existsSync;
+  const readFile = fsDeps?.readFileSync ?? readFileSync;
+  const statFile = fsDeps?.statSync ?? statSync;
+  const absPath = path.resolve(packagePath);
+
+  const packageJsonPath = path.join(absPath, "package.json");
+  if (!fileExists(packageJsonPath)) return null;
+
+  let packageJson: PluginPackageJson | null = null;
+  try {
+    packageJson = JSON.parse(readFile(packageJsonPath, "utf8")) as PluginPackageJson;
+  } catch {
+    return null;
+  }
+
+  const manifestRel = packageJson?.paperclipPlugin?.manifest;
+  if (typeof manifestRel !== "string" || manifestRel.length === 0) return null;
+
+  const resolved = path.resolve(absPath, manifestRel);
+  if (!fileExists(resolved)) return null;
+  if (statFile(resolved).isDirectory()) return null;
+  return resolved;
+}
+
+/**
  * Create a PluginDevWatcher that monitors local plugin directories and
  * restarts workers on file changes.
  */
@@ -163,6 +201,8 @@ export function createPluginDevWatcher(
 ): PluginDevWatcher {
   const watchers = new Map<string, FSWatcher>();
   const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  const manifestPaths = new Map<string, string>();
+  const pendingChangedPaths = new Map<string, Set<string>>();
   const fileExists = fsDeps?.existsSync ?? existsSync;
 
   function watchPlugin(pluginId: string, packagePath: string): void {
@@ -188,6 +228,11 @@ export function createPluginDevWatcher(
         return;
       }
 
+      const manifestEntry = resolvePluginManifestEntry(absPath, fsDeps);
+      if (manifestEntry) {
+        manifestPaths.set(pluginId, manifestEntry);
+      }
+
       const watcher = chokidar.watch(
         watcherTargets.map((target) => target.path),
         {
@@ -207,6 +252,14 @@ export function createPluginDevWatcher(
         const relativePath = path.relative(absPath, changedPath);
         if (shouldIgnorePath(relativePath)) return;
 
+        const resolvedChangedPath = path.resolve(changedPath);
+        let pending = pendingChangedPaths.get(pluginId);
+        if (!pending) {
+          pending = new Set<string>();
+          pendingChangedPaths.set(pluginId, pending);
+        }
+        pending.add(resolvedChangedPath);
+
         const existing = debounceTimers.get(pluginId);
         if (existing) clearTimeout(existing);
 
@@ -214,8 +267,32 @@ export function createPluginDevWatcher(
           pluginId,
           setTimeout(() => {
             debounceTimers.delete(pluginId);
+            const changedPaths = pendingChangedPaths.get(pluginId) ?? new Set<string>();
+            pendingChangedPaths.delete(pluginId);
+
+            const manifestPath = manifestPaths.get(pluginId);
+            const manifestChanged = manifestPath ? changedPaths.has(manifestPath) : false;
+            const changedFile = relativePath || path.basename(changedPath);
+
+            if (manifestChanged) {
+              log.info(
+                { pluginId, changedFile, manifestPath },
+                "plugin-dev-watcher: manifest change detected, reactivating plugin",
+              );
+              reactivatePlugin(pluginId).catch((err) => {
+                log.warn(
+                  {
+                    pluginId,
+                    err: err instanceof Error ? err.message : String(err),
+                  },
+                  "plugin-dev-watcher: failed to reactivate plugin after manifest change",
+                );
+              });
+              return;
+            }
+
             log.info(
-              { pluginId, changedFile: relativePath || path.basename(changedPath) },
+              { pluginId, changedFile },
               "plugin-dev-watcher: file change detected, restarting worker",
             );
 
@@ -279,6 +356,35 @@ export function createPluginDevWatcher(
       clearTimeout(timer);
       debounceTimers.delete(pluginId);
     }
+    manifestPaths.delete(pluginId);
+    pendingChangedPaths.delete(pluginId);
+  }
+
+  /**
+   * Full plugin reactivation cycle: disable → enable.
+   *
+   * Used for manifest changes so the lifecycle re-runs activation, which
+   * rebuilds host-side capability validators, re-registers tools/jobs/event
+   * subscriptions/webhooks, and spawns a fresh worker. This is heavier than
+   * `restartWorker` (worker process only) but is the right granularity when
+   * the manifest itself has changed.
+   *
+   * Note: this does not re-read the manifest from disk into the DB — the
+   * lifecycle activates from `plugin.manifestJson` (DB-cached). To pick up
+   * manifest schema changes (new tools, capabilities, jobs), reinstall or
+   * upgrade the plugin. The startup capability-drift warning surfaces this
+   * mismatch when it happens.
+   */
+  async function reactivatePlugin(pluginId: string): Promise<void> {
+    try {
+      await lifecycle.disable(pluginId, "dev-watcher: manifest reload");
+    } catch (err) {
+      log.warn(
+        { pluginId, err: err instanceof Error ? err.message : String(err) },
+        "plugin-dev-watcher: disable step of manifest reload failed; attempting enable anyway",
+      );
+    }
+    await lifecycle.enable(pluginId);
   }
 
   function close(): void {

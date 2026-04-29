@@ -2,7 +2,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { resolvePluginWatchTargets } from "../services/plugin-dev-watcher.js";
+import {
+  resolvePluginManifestEntry,
+  resolvePluginWatchTargets,
+} from "../services/plugin-dev-watcher.js";
 
 const tempDirs: string[] = [];
 
@@ -48,6 +51,49 @@ describe("resolvePluginWatchTargets", () => {
       { path: path.join(pluginDir, "dist", "worker.js"), recursive: false, kind: "file" },
       { path: path.join(pluginDir, "package.json"), recursive: false, kind: "file" },
     ]);
+  });
+
+  it("resolves the manifest entrypoint to an absolute path", () => {
+    const pluginDir = makeTempPluginDir();
+    mkdirSync(path.join(pluginDir, "dist"), { recursive: true });
+    writeFileSync(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({
+        name: "@acme/example",
+        paperclipPlugin: { manifest: "./dist/manifest.js" },
+      }),
+    );
+    writeFileSync(path.join(pluginDir, "dist", "manifest.js"), "export default {};\n");
+
+    expect(resolvePluginManifestEntry(pluginDir)).toBe(
+      path.join(pluginDir, "dist", "manifest.js"),
+    );
+  });
+
+  it("returns null when package.json is missing", () => {
+    const pluginDir = makeTempPluginDir();
+    expect(resolvePluginManifestEntry(pluginDir)).toBeNull();
+  });
+
+  it("returns null when paperclipPlugin.manifest is missing", () => {
+    const pluginDir = makeTempPluginDir();
+    writeFileSync(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({ name: "@acme/example" }),
+    );
+    expect(resolvePluginManifestEntry(pluginDir)).toBeNull();
+  });
+
+  it("returns null when manifest entry does not exist on disk", () => {
+    const pluginDir = makeTempPluginDir();
+    writeFileSync(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({
+        name: "@acme/example",
+        paperclipPlugin: { manifest: "./dist/manifest.js" },
+      }),
+    );
+    expect(resolvePluginManifestEntry(pluginDir)).toBeNull();
   });
 
   it("falls back to dist when package metadata does not declare entrypoints", () => {
