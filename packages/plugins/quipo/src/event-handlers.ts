@@ -60,6 +60,84 @@ export function extractionIdempotencyStateKey(originId: string): ScopeKey {
 
 const idempotencyStateKey = extractionIdempotencyStateKey;
 
+/** Per-source state key. Tracks the currently-open extraction issue for a
+ *  given source issue plus the set of comment ids already batched into it,
+ *  so new fact-bearing events can be folded into the existing extraction
+ *  instead of opening a fresh ticket each time (RED-163 batching). */
+export function extractionSourceStateKey(sourceIssueId: string): ScopeKey {
+  return {
+    scopeKind: "instance",
+    namespace: STATE_NAMESPACE,
+    stateKey: `source:${sourceIssueId}`,
+  };
+}
+
+/** State persisted under {@link extractionSourceStateKey}. */
+interface ExtractionSourceState {
+  /** Currently-open extraction issue for this source, if any. Cleared when
+   *  the extraction issue closes (`done`, `cancelled`, or `blocked`) so the
+   *  next event opens a fresh ticket. */
+  openExtractionIssueId: string | null;
+  /** Comment ids already folded into the current open extraction issue.
+   *  Used to dedupe at-least-once redeliveries of the same `comment.created`
+   *  event so the same snippet is never appended twice. */
+  batchedCommentIds: string[];
+  /** Issue-update originIds (`update:${sourceIssueId}:${updatedAt}`) already
+   *  folded into the current open extraction issue. */
+  batchedUpdateOriginIds: string[];
+}
+
+function emptySourceState(): ExtractionSourceState {
+  return { openExtractionIssueId: null, batchedCommentIds: [], batchedUpdateOriginIds: [] };
+}
+
+async function readSourceState(
+  ctx: PluginContext,
+  sourceIssueId: string,
+): Promise<ExtractionSourceState> {
+  const raw = (await ctx.state.get(extractionSourceStateKey(sourceIssueId))) as
+    | Partial<ExtractionSourceState>
+    | null
+    | undefined;
+  if (!raw) return emptySourceState();
+  return {
+    openExtractionIssueId: raw.openExtractionIssueId ?? null,
+    batchedCommentIds: Array.isArray(raw.batchedCommentIds) ? raw.batchedCommentIds : [],
+    batchedUpdateOriginIds: Array.isArray(raw.batchedUpdateOriginIds) ? raw.batchedUpdateOriginIds : [],
+  };
+}
+
+async function writeSourceState(
+  ctx: PluginContext,
+  sourceIssueId: string,
+  state: ExtractionSourceState,
+): Promise<void> {
+  await ctx.state.set(extractionSourceStateKey(sourceIssueId), state);
+}
+
+const SOURCE_STATE_OPEN_ISSUE_STATUSES: ReadonlySet<string> = new Set([
+  "todo",
+  "in_progress",
+  "in_review",
+]);
+
+/** Return the per-source state's `openExtractionIssueId` only if the issue
+ *  is still in an "open" status (not done/cancelled/blocked). If the issue
+ *  closed since we last wrote state, transparently clear the field so the
+ *  caller treats this source as having no open extraction. */
+async function resolveOpenExtractionIssueId(
+  ctx: PluginContext,
+  companyId: string,
+  state: ExtractionSourceState,
+): Promise<string | null> {
+  if (!state.openExtractionIssueId) return null;
+  const open = await ctx.issues.get(state.openExtractionIssueId, companyId);
+  if (open && SOURCE_STATE_OPEN_ISSUE_STATUSES.has(open.status)) {
+    return open.id;
+  }
+  return null;
+}
+
 export function parseErrorCountStateKey(extractionIssueId: string): ScopeKey {
   return {
     scopeKind: "instance",
@@ -170,6 +248,7 @@ export interface EnqueueCommentExtractionInput {
 
 export type EnqueueCommentExtractionResult =
   | { status: "queued"; extractionIssueId: string; originId: string }
+  | { status: "appended"; extractionIssueId: string; originId: string }
   | { status: "already_extracted"; extractionIssueId: string | null; originId: string }
   | { status: "skipped"; reason: "memory_agent_authored" | "plugin_origin"; originId: string };
 
@@ -218,7 +297,11 @@ export async function enqueueCommentExtraction(
     return { status: "skipped", reason: "plugin_origin", originId };
   }
 
-  const lockKey = `${companyId}:${originId}`;
+  // RED-163: serialise per-source so the open-extraction lookup + create/append
+  // decision is atomic. The previous per-comment lock allowed two concurrent
+  // comments on the same source to each observe "no open extraction" and
+  // create duplicate tickets.
+  const lockKey = `${companyId}:source:${sourceIssue.id}`;
 
   return withClaimLock(lockKey, async () => {
     const dedupe = await alreadyExtracted(ctx, companyId, originId);
@@ -234,8 +317,81 @@ export async function enqueueCommentExtraction(
       } as const;
     }
 
+    const sourceState = await readSourceState(ctx, sourceIssue.id);
+    if (sourceState.batchedCommentIds.includes(commentId)) {
+      // Source-state already records this comment as folded into the open
+      // extraction issue. This is the cross-process / cross-restart fallback
+      // when the per-comment idempotency state was lost (e.g. crash between
+      // append and `state.set(idempotencyStateKey)`).
+      return {
+        status: "already_extracted",
+        extractionIssueId: sourceState.openExtractionIssueId,
+        originId,
+      } as const;
+    }
+
     const identifier = identifierHint ?? sourceIssue.identifier ?? sourceIssue.id;
     const titlePrefix = sourceKind === "backfill" ? "Quipo backfill" : "Quipo";
+    const snippetBlock = quote((bodySnippet ?? "").slice(0, 240));
+
+    // RED-163 batching: if there is already an open extraction issue for this
+    // source, append the new comment to its description instead of opening a
+    // fresh ticket. The memory-worker re-reads the issue body on its next
+    // wake and will harvest all batched snippets together.
+    const openExtractionIssueId = await resolveOpenExtractionIssueId(
+      ctx,
+      companyId,
+      sourceState,
+    );
+    if (openExtractionIssueId) {
+      const appendBody = [
+        `Additional comment on ${identifier} (batched into the same extraction):`,
+        "",
+        `- source issue: ${sourceIssue.id}`,
+        `- comment id: ${commentId}`,
+        `- source_comment_id: ${commentId}`,
+        authorAgentId ? `- author agent: ${authorAgentId}` : "- author: board user",
+        `- source kind: ${sourceKind}`,
+        "",
+        "Snippet:",
+        snippetBlock,
+      ].join("\n");
+
+      await ctx.issues.createComment(openExtractionIssueId, appendBody, companyId, {
+        authorAgentId: authorAgentId ?? undefined,
+      });
+
+      await writeSourceState(ctx, sourceIssue.id, {
+        ...sourceState,
+        openExtractionIssueId,
+        batchedCommentIds: [...sourceState.batchedCommentIds, commentId],
+      });
+
+      // Anchor per-comment idempotency to the existing extraction issue so a
+      // redelivered `comment.created` event short-circuits via
+      // `alreadyExtracted` rather than appending a duplicate batched comment.
+      await ctx.state.set(idempotencyStateKey(originId), {
+        extractionIssueId: openExtractionIssueId,
+        eventId: eventId ?? null,
+        sourceKind,
+        source_comment_id: commentId,
+        batched: true,
+      });
+
+      ctx.logger.info("Quipo: appended comment to existing extraction (batched)", {
+        sourceIssueId: sourceIssue.id,
+        commentId,
+        extractionIssueId: openExtractionIssueId,
+        sourceKind,
+      });
+
+      return {
+        status: "appended",
+        extractionIssueId: openExtractionIssueId,
+        originId,
+      } as const;
+    }
+
     const description = [
       sourceKind === "backfill"
         ? `Extract atomic facts from an existing comment on ${identifier} (queued by RED-103 backfill).`
@@ -248,7 +404,7 @@ export async function enqueueCommentExtraction(
       `- source kind: ${sourceKind}`,
       "",
       "Snippet:",
-      quote((bodySnippet ?? "").slice(0, 240)),
+      snippetBlock,
       "",
       "Return your response as a single JSON object matching the memory-worker output contract.",
     ].join("\n");
@@ -262,6 +418,10 @@ export async function enqueueCommentExtraction(
       priority: "low",
       assigneeAgentId: memoryAgentId,
       originId,
+      // RED-163: keep extraction issues out of human-facing default list views.
+      // The server's `/issues` route applies `isNull(hiddenAt)` unless the
+      // caller opts in via `?includeHidden=true`.
+      hiddenAt: new Date(),
       inheritExecutionWorkspaceFromIssueId: sourceIssue.id,
       actor: {
         actorAgentId: authorAgentId ?? null,
@@ -278,6 +438,12 @@ export async function enqueueCommentExtraction(
       // matching this value, which lets backfill skip comments that already
       // produced facts.
       source_comment_id: commentId,
+    });
+
+    await writeSourceState(ctx, sourceIssue.id, {
+      openExtractionIssueId: extractionIssue.id,
+      batchedCommentIds: [commentId],
+      batchedUpdateOriginIds: [],
     });
 
     const link: ExtractionLink = {
@@ -429,7 +595,9 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
   // rather than the transport event id, so at-least-once redelivery with a new
   // eventId for the same logical patch does not enqueue duplicate work.
   const originId = updateOriginId(sourceIssue.id, sourceIssue.updatedAt);
-  const lockKey = `${event.companyId}:${originId}`;
+  // RED-163: serialise per source so the open-extraction lookup + create/append
+  // decision is atomic across concurrent comment + update events.
+  const lockKey = `${event.companyId}:source:${sourceIssue.id}`;
 
   await withClaimLock(lockKey, async () => {
     const dedupe = await alreadyExtracted(ctx, event.companyId, originId);
@@ -441,14 +609,69 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
       return;
     }
 
+    const sourceState = await readSourceState(ctx, sourceIssue.id);
+    if (sourceState.batchedUpdateOriginIds.includes(originId)) {
+      // Cross-process / cross-restart fallback: source-state already records
+      // this update originId as folded into the open extraction issue.
+      return;
+    }
+
     const identifier = payload.identifier ?? sourceIssue.identifier ?? sourceIssue.id;
     const patchSummary = JSON.stringify(payload.patch ?? {});
+    const updatedAtIso =
+      sourceIssue.updatedAt instanceof Date ? sourceIssue.updatedAt.toISOString() : sourceIssue.updatedAt;
+
+    // RED-163 batching: if there is already an open extraction issue for this
+    // source, append the patch to it instead of opening a fresh ticket.
+    const openExtractionIssueId = await resolveOpenExtractionIssueId(
+      ctx,
+      event.companyId,
+      sourceState,
+    );
+    if (openExtractionIssueId) {
+      const appendBody = [
+        `Additional update on ${identifier} (batched into the same extraction):`,
+        "",
+        `- source issue: ${sourceIssue.id}`,
+        `- source updatedAt: ${updatedAtIso}`,
+        `- event id: ${event.eventId}`,
+        payload.agentId ? `- updated by agent: ${payload.agentId}` : "- updated by: board user",
+        "",
+        "Patch:",
+        "```json",
+        patchSummary,
+        "```",
+      ].join("\n");
+
+      await ctx.issues.createComment(openExtractionIssueId, appendBody, event.companyId, {
+        authorAgentId: payload.agentId ?? undefined,
+      });
+
+      await writeSourceState(ctx, sourceIssue.id, {
+        ...sourceState,
+        openExtractionIssueId,
+        batchedUpdateOriginIds: [...sourceState.batchedUpdateOriginIds, originId],
+      });
+
+      await ctx.state.set(idempotencyStateKey(originId), {
+        extractionIssueId: openExtractionIssueId,
+        eventId: event.eventId,
+        batched: true,
+      });
+
+      ctx.logger.info("Quipo: appended issue-update to existing extraction (batched)", {
+        sourceIssueId: sourceIssue.id,
+        extractionIssueId: openExtractionIssueId,
+        originId,
+      });
+      return;
+    }
 
     const description = [
       `Extract atomic facts from an update to ${identifier}.`,
       "",
       `- source issue: ${sourceIssue.id}`,
-      `- source updatedAt: ${sourceIssue.updatedAt instanceof Date ? sourceIssue.updatedAt.toISOString() : sourceIssue.updatedAt}`,
+      `- source updatedAt: ${updatedAtIso}`,
       `- event id: ${event.eventId}`,
       payload.agentId ? `- updated by agent: ${payload.agentId}` : "- updated by: board user",
       "",
@@ -469,6 +692,8 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
       priority: "low",
       assigneeAgentId: memoryAgentId,
       originId,
+      // RED-163: hide from default human-facing list views.
+      hiddenAt: new Date(),
       inheritExecutionWorkspaceFromIssueId: sourceIssue.id,
       actor: {
         actorAgentId: payload.agentId ?? null,
@@ -479,6 +704,12 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
     await ctx.state.set(idempotencyStateKey(originId), {
       extractionIssueId: extractionIssue.id,
       eventId: event.eventId,
+    });
+
+    await writeSourceState(ctx, sourceIssue.id, {
+      openExtractionIssueId: extractionIssue.id,
+      batchedCommentIds: [],
+      batchedUpdateOriginIds: [originId],
     });
 
     const updateLink: ExtractionLink = {
@@ -673,6 +904,35 @@ async function clearParseErrorState(
   }
 }
 
+/** Clear the per-source batch state for the source backing this extraction
+ *  issue, so the next fact-bearing event on that source opens a fresh
+ *  extraction ticket instead of trying to append to a closed/blocked one
+ *  (RED-163). Idempotent and best-effort: failures are logged but do not
+ *  bubble up — the worst case is one duplicate extraction issue on the next
+ *  event, which the create path's per-source state write self-heals. */
+async function clearSourceBatchStateForExtraction(
+  ctx: PluginContext,
+  extractionIssueId: string,
+): Promise<void> {
+  try {
+    const link = (await ctx.state.get(extractionLinkStateKey(extractionIssueId))) as
+      | ExtractionLink
+      | null
+      | undefined;
+    if (!link?.sourceIssueId) return;
+    const sourceState = await readSourceState(ctx, link.sourceIssueId);
+    if (sourceState.openExtractionIssueId === extractionIssueId) {
+      await ctx.state.delete(extractionSourceStateKey(link.sourceIssueId));
+    }
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    ctx.logger.warn("Quipo: failed to clear per-source batch state", {
+      extractionIssueId,
+      detail,
+    });
+  }
+}
+
 /** Force-close the extraction issue and surface any close failure loudly so
  *  the loop can be diagnosed from run logs. RED-162 originally swallowed close
  *  failures at `debug`, hiding the cause of the self-loop. */
@@ -700,7 +960,13 @@ async function closeExtractionIssue(
       detail,
       stack,
     });
+    return;
   }
+
+  // RED-163 batching: clear the per-source state so the next event for this
+  // source opens a fresh extraction ticket instead of trying to append to the
+  // closed one.
+  await clearSourceBatchStateForExtraction(ctx, extractionIssueId);
 }
 
 interface HandleParseErrorInput {
@@ -810,7 +1076,13 @@ async function handleParseError(
       detail: updateDetail,
       stack,
     });
+    return;
   }
+
+  // RED-163 batching: a blocked extraction issue is no longer "open" for
+  // append; clear per-source state so the next fact-bearing event opens a
+  // fresh ticket.
+  await clearSourceBatchStateForExtraction(ctx, extractionIssue.id);
 }
 
 export function registerQuipoEventHandlers(ctx: PluginContext): void {

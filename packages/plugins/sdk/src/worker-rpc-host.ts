@@ -636,6 +636,10 @@ export function startWorkerRpcHost(options: WorkerRpcHostOptions): WorkerRpcHost
             executionWorkspaceId: input.executionWorkspaceId,
             executionWorkspacePreference: input.executionWorkspacePreference,
             executionWorkspaceSettings: input.executionWorkspaceSettings,
+            hiddenAt:
+              input.hiddenAt instanceof Date
+                ? input.hiddenAt.toISOString()
+                : (input.hiddenAt ?? undefined),
             actorAgentId: input.actor?.actorAgentId,
             actorUserId: input.actor?.actorUserId,
             actorRunId: input.actor?.actorRunId,

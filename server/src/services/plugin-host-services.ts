@@ -1031,10 +1031,17 @@ export function buildHostServices(
       async create(params) {
         const companyId = ensureCompanyId(params.companyId);
         await ensurePluginAvailableForCompany(companyId);
-        const { actorAgentId, actorUserId, actorRunId, originKind, ...issueInput } = params;
+        const { actorAgentId, actorUserId, actorRunId, originKind, hiddenAt, ...issueInput } = params;
         const normalizedOriginKind = normalizePluginOriginKind(originKind);
+        const normalizedHiddenAt =
+          typeof hiddenAt === "string" && hiddenAt.length > 0
+            ? new Date(hiddenAt)
+            : hiddenAt === null
+              ? null
+              : undefined;
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
+          ...(normalizedHiddenAt !== undefined ? { hiddenAt: normalizedHiddenAt } : {}),
           originKind: normalizedOriginKind,
           originId: params.originId ?? null,
           originRunId: params.originRunId ?? actorRunId ?? null,
