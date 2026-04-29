@@ -6,7 +6,9 @@ import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/tes
 
 import manifest from "../src/manifest.js";
 import {
+  MAX_BATCHED_DEDUPE_ENTRIES,
   commentOriginId,
+  extractionSourceStateKey,
   parseErrorCountStateKey,
   registerQuipoEventHandlers,
 } from "../src/event-handlers.js";
@@ -238,6 +240,40 @@ describe("Quipo event handlers — issue.comment.created", () => {
     const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
     const extractions = all.filter((issue) => issue.originId === `comment:${commentId}`);
     expect(extractions).toHaveLength(1);
+  });
+
+  it("RED-173: caps per-source batchedCommentIds at MAX_BATCHED_DEDUPE_ENTRIES (no unbounded growth)", async () => {
+    // Open an extraction issue for the source.
+    const { commentId: firstCommentId } = await emitCommentCreated(harness);
+    const allAfterFirst = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extraction = allAfterFirst.find((issue) => issue.originId === `comment:${firstCommentId}`);
+    expect(extraction).toBeDefined();
+
+    // Pre-fill the per-source dedupe array with MAX_BATCHED_DEDUPE_ENTRIES
+    // synthetic comment ids so we exercise the cap without emitting thousands
+    // of events. This simulates a long-lived open extraction on a high-volume
+    // source.
+    const stateKey = extractionSourceStateKey(SOURCE_ISSUE_ID);
+    const synthetic = Array.from({ length: MAX_BATCHED_DEDUPE_ENTRIES }, (_, i) => `synthetic-${i}`);
+    await harness.ctx.state.set(stateKey, {
+      openExtractionIssueId: extraction!.id,
+      batchedCommentIds: [firstCommentId, ...synthetic],
+      batchedUpdateOriginIds: [],
+    });
+
+    // Real fresh comment must batch and the dedupe array must stay bounded.
+    const { commentId: nextCommentId } = await emitCommentCreated(harness);
+    const stateAfter = (await harness.ctx.state.get(stateKey)) as
+      | { batchedCommentIds: string[]; batchedUpdateOriginIds: string[]; openExtractionIssueId: string | null }
+      | null;
+    expect(stateAfter).not.toBeNull();
+    expect(stateAfter!.openExtractionIssueId).toBe(extraction!.id);
+    expect(stateAfter!.batchedCommentIds.length).toBeLessThanOrEqual(MAX_BATCHED_DEDUPE_ENTRIES);
+    // The newest entry must be retained — it's the redelivery dedupe anchor.
+    expect(stateAfter!.batchedCommentIds.at(-1)).toBe(nextCommentId);
+    // The oldest entry (the original first comment) must have been evicted in
+    // favour of the newer ones.
+    expect(stateAfter!.batchedCommentIds).not.toContain(firstCommentId);
   });
 
   it("is idempotent under concurrent delivery of the same comment", async () => {
