@@ -77,6 +77,34 @@ async function getQuipoRuntimeConfig(ctx: PluginContext) {
 }
 
 /**
+ * Wake the memory agent on a freshly-created extraction issue so the wake
+ * payload carries `issueId`. Without this, `claude_local` worker agents
+ * receiving the assignment via the heartbeat scheduler do not get
+ * `paperclipIssue` in their context snapshot and respond "I do not see a task"
+ * (RED-133). Failures are logged but never propagated — the extraction issue
+ * already exists and downstream retry paths can still pick it up.
+ */
+async function wakeExtractionAssignee(
+  ctx: PluginContext,
+  companyId: string,
+  extractionIssueId: string,
+  reason: string,
+): Promise<void> {
+  try {
+    await ctx.issues.requestWakeup(extractionIssueId, companyId, {
+      reason,
+      contextSource: `plugin:${QUIPO_PLUGIN_ID}`,
+      idempotencyKey: `quipo:wake:${extractionIssueId}`,
+    });
+  } catch (err) {
+    ctx.logger.warn("Quipo: failed to wake memory agent for extraction issue", {
+      extractionIssueId,
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
  * In-process per-key serialization so two concurrent event deliveries handled by
  * the same worker process cannot both observe missing idempotency state and
  * both create extraction issues. Cross-process safety additionally relies on
@@ -266,6 +294,13 @@ export async function enqueueCommentExtraction(
       extractionIssueId: extractionIssue.id,
       sourceKind,
     });
+
+    await wakeExtractionAssignee(
+      ctx,
+      companyId,
+      extractionIssue.id,
+      `quipo extraction for ${identifier} (${sourceKind})`,
+    );
 
     return {
       status: "queued",
@@ -457,6 +492,13 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
       extractionIssueId: extractionIssue.id,
       originId,
     });
+
+    await wakeExtractionAssignee(
+      ctx,
+      event.companyId,
+      extractionIssue.id,
+      `quipo extraction for ${identifier} (issue_update)`,
+    );
   });
 }
 
