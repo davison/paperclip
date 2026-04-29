@@ -189,6 +189,35 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     ).rejects.toThrow("Plugin may only use originKind values under plugin:paperclip.missions");
   });
 
+  it("rejects invalid hiddenAt strings on plugin issues.create (RED-173)", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    await expect(
+      services.issues.create({
+        companyId,
+        title: "Invalid hiddenAt",
+        hiddenAt: "not-a-date" as any,
+      }),
+    ).rejects.toThrow(/hiddenAt must be a valid ISO timestamp/);
+
+    const okIssue = await services.issues.create({
+      companyId,
+      title: "Valid hiddenAt",
+      hiddenAt: "2026-04-29T10:00:00.000Z" as any,
+    });
+    const [stored] = await db.select().from(issues).where(eq(issues.id, okIssue.id));
+    expect(stored?.hiddenAt).toBeInstanceOf(Date);
+    expect(stored?.hiddenAt?.toISOString()).toBe("2026-04-29T10:00:00.000Z");
+
+    const visibleIssue = await services.issues.create({
+      companyId,
+      title: "No hiddenAt",
+    });
+    const [visibleStored] = await db.select().from(issues).where(eq(issues.id, visibleIssue.id));
+    expect(visibleStored?.hiddenAt).toBeNull();
+  });
+
   it("asserts checkout ownership for run-scoped plugin actions", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();
