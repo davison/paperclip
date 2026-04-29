@@ -293,7 +293,7 @@ describe("Quipo event handlers — issue.comment.created", () => {
     expect(extraction!.description).toContain("Comment body:");
     expect(extraction!.description).toContain("(truncated to 8000 chars");
     // Description must contain at least one full clipped chunk but not all 12,000 chars.
-    expect(extraction!.description.length).toBeLessThan(fullBody.length);
+    expect(extraction!.description!.length).toBeLessThan(fullBody.length);
   });
 
   it("RED-131: falls back to the bodySnippet when listComments cannot resolve the comment", async () => {
