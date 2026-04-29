@@ -24,7 +24,7 @@
  * @see PLUGIN_SPEC.md §10 — Package Contract
  * @see PLUGIN_SPEC.md §12 — Process Model
  */
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { readdir, readFile, rm, stat } from "node:fs/promises";
 import { execFile } from "node:child_process";
 import os from "node:os";
@@ -562,15 +562,29 @@ export function resolveManifestPath(
 ): string | null {
   // Enforce that any resolved manifest path remains within packageRoot.
   // The host dynamically `import()`s this path during activation/drift checks,
-  // so a `..`-escaping or absolute-path manifest pointer in package.json could
-  // execute arbitrary host-process module top-level code from outside the
-  // plugin package. This is the trust-boundary control: a manifest pointer
-  // that escapes its package root is treated as no manifest at all.
+  // so a `..`-escaping, absolute-outside, or symlink-escaping manifest pointer
+  // in package.json could execute arbitrary host-process module top-level code
+  // from outside the plugin package. The trust-boundary control: any manifest
+  // pointer that escapes its package root — lexically OR after symlink
+  // resolution — is treated as no manifest at all.
+  //
+  // Containment is enforced on canonical (realpath-resolved) paths so an
+  // attacker cannot smuggle an in-root pointer through an in-root symlink that
+  // dereferences outside the package.
   const normalizedRoot = path.resolve(packageRoot);
+  const canonicalRoot = canonicalizePath(normalizedRoot);
+  if (canonicalRoot === null) {
+    // packageRoot itself is unresolvable (deleted under us, or all ancestors
+    // missing). Refuse rather than fall through to fallback joins that would
+    // not be containment-checked.
+    return null;
+  }
+
   const isInsideRoot = (candidate: string): boolean => {
-    const resolved = path.resolve(candidate);
-    if (resolved === normalizedRoot) return true;
-    const rel = path.relative(normalizedRoot, resolved);
+    const canonicalCandidate = canonicalizePath(candidate);
+    if (canonicalCandidate === null) return false;
+    if (canonicalCandidate === canonicalRoot) return true;
+    const rel = path.relative(canonicalRoot, canonicalCandidate);
     return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
   };
 
@@ -590,34 +604,80 @@ export function resolveManifestPath(
           {
             service: "plugin-loader",
             packageRoot: normalizedRoot,
+            canonicalPackageRoot: canonicalRoot,
             manifestRelPath,
             resolvedManifestPath: candidate,
+            canonicalManifestPath: canonicalizePath(candidate),
           },
           "plugin-loader: package.json paperclipPlugin.manifest pointer " +
-            "escapes the package root; refusing to resolve. The manifest " +
-            "must live inside its own package directory.",
+            "escapes the package root (after symlink resolution); refusing " +
+            "to resolve. The manifest must live inside its own package " +
+            "directory and may not traverse out via symlinks.",
         );
         return null;
       }
       // NOTE: the resolved path is returned as-is even if the file does not yet
       // exist on disk (e.g. the package has not been built).  Callers MUST guard
       // with existsSync() before passing the path to loadManifestFromPath().
+      // The return value preserves the lexical (caller-facing) path; the
+      // canonical realpath was used only for the trust-boundary check above.
       return candidate;
     }
   }
 
-  // Fallback: look for dist/manifest.js as a convention
+  // Fallback: look for dist/manifest.js as a convention. These joins start at
+  // packageRoot and use fixed segments, but a symlink at dist/manifest.js
+  // could still dereference outside the root, so we still containment-check.
   const conventionalPath = path.join(packageRoot, "dist", "manifest.js");
-  if (existsSync(conventionalPath)) {
+  if (existsSync(conventionalPath) && isInsideRoot(conventionalPath)) {
     return conventionalPath;
   }
 
   // Fallback: look for manifest.js at package root
   const rootManifestPath = path.join(packageRoot, "manifest.js");
-  if (existsSync(rootManifestPath)) {
+  if (existsSync(rootManifestPath) && isInsideRoot(rootManifestPath)) {
     return rootManifestPath;
   }
 
+  return null;
+}
+
+/**
+ * Canonicalize a path by resolving symlinks. If the path itself does not
+ * exist, walk up to the deepest existing ancestor, realpath that, and
+ * re-attach the missing suffix. Returns `null` only if no ancestor up to
+ * the filesystem root can be realpath-resolved.
+ *
+ * Used by `resolveManifestPath` so containment checks compare canonical
+ * (symlink-resolved) paths rather than lexical ones — preventing escape
+ * via an in-root symlink that dereferences outside the package.
+ *
+ * Caveat: containment is checked against the filesystem state at this call
+ * site. A subsequent attacker-controlled symlink swap between this check
+ * and the eventual `import(manifestPath)` is a TOCTOU window outside the
+ * scope of this control; mitigated by the package install layer treating
+ * extracted package trees as trusted-once-installed and re-running this
+ * check on every load/drift cycle.
+ */
+function canonicalizePath(candidate: string): string | null {
+  const absolute = path.resolve(candidate);
+  let current = absolute;
+  const trailingSegments: string[] = [];
+  // Bound the walk by the lexical absolute path's depth — `path.dirname`
+  // converges to itself at the filesystem root, terminating naturally.
+  for (let i = 0; i < 4096; i += 1) {
+    try {
+      const real = realpathSync(current);
+      return trailingSegments.length === 0
+        ? real
+        : path.join(real, ...trailingSegments.reverse());
+    } catch {
+      const parent = path.dirname(current);
+      if (parent === current) return null;
+      trailingSegments.push(path.basename(current));
+      current = parent;
+    }
+  }
   return null;
 }
 
