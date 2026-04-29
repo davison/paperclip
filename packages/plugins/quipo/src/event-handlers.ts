@@ -695,11 +695,38 @@ async function handleParseError(
   const { extractionIssue, companyId, memoryAgentId, runId, commentId, detail } = input;
   const stateKey = parseErrorCountStateKey(extractionIssue.id);
   const prior = (await ctx.state.get(stateKey)) as
-    | { count?: number }
+    | { count?: number; countedCommentIds?: string[] }
     | null
     | undefined;
-  const nextCount = (prior?.count ?? 0) + 1;
-  await ctx.state.set(stateKey, { count: nextCount, lastDetail: detail, at: new Date().toISOString() });
+  const priorCount = prior?.count ?? 0;
+  const priorCounted = Array.isArray(prior?.countedCommentIds)
+    ? prior!.countedCommentIds!
+    : [];
+
+  // RED-166: events are at-least-once. A redelivered parse_error for the
+  // *same* commentId must not advance the retry counter — otherwise a single
+  // bad worker reply, replayed by the event bus, can trip
+  // MAX_PARSE_ERROR_ATTEMPTS and mark the issue `blocked` without any new
+  // worker attempt. The counter measures distinct failed attempts, not event
+  // deliveries.
+  if (priorCounted.includes(commentId)) {
+    ctx.logger.debug("Quipo: parse_error redelivery — skipping retry-counter increment", {
+      extractionIssueId: extractionIssue.id,
+      commentId,
+      attempts: priorCount,
+      maxAttempts: MAX_PARSE_ERROR_ATTEMPTS,
+    });
+    return;
+  }
+
+  const nextCount = priorCount + 1;
+  const nextCounted = [...priorCounted, commentId];
+  await ctx.state.set(stateKey, {
+    count: nextCount,
+    countedCommentIds: nextCounted,
+    lastDetail: detail,
+    at: new Date().toISOString(),
+  });
 
   if (nextCount < MAX_PARSE_ERROR_ATTEMPTS) {
     ctx.logger.warn("Quipo: extraction parse_error — keeping issue open for retry", {
