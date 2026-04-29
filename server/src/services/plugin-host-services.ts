@@ -1630,6 +1630,18 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const agent = await agents.getById(params.agentId);
         requireInCompany("Agent", agent, companyId);
+        // RED-164: short-circuit on paused/terminated/pending_approval before
+        // calling heartbeat.wakeup so plugin handlers see a deterministic,
+        // contractual error instead of relying on heartbeat's internal skip
+        // path. The wakeup call below is also guarded inside heartbeatService;
+        // this check just makes the failure mode obvious to plugin authors.
+        if (
+          agent!.status === "paused" ||
+          agent!.status === "terminated" ||
+          agent!.status === "pending_approval"
+        ) {
+          throw new Error(`Agent wakeup was suppressed: agent_${agent!.status}`);
+        }
         const run = await heartbeat.wakeup(params.agentId, {
           source: "automation",
           triggerDetail: "system",
@@ -1759,6 +1771,21 @@ export function buildHostServices(
           )
           .then((rows) => rows[0] ?? null);
         if (!session) throw new Error(`Session not found: ${params.sessionId}`);
+
+        // RED-164: pre-check the session's agent status. If the agent has been
+        // paused (or terminated / pending_approval) the wake must be suppressed
+        // hard — even if the plugin keeps trying. heartbeatService also
+        // re-checks this internally, but failing fast here gives the plugin a
+        // clear, structured error rather than the generic "skipped by policy".
+        const sessionAgent = await agents.getById(session.agentId);
+        if (
+          sessionAgent &&
+          (sessionAgent.status === "paused" ||
+            sessionAgent.status === "terminated" ||
+            sessionAgent.status === "pending_approval")
+        ) {
+          throw new Error(`Agent wakeup was suppressed: agent_${sessionAgent.status}`);
+        }
 
         const run = await heartbeat.wakeup(session.agentId, {
           source: "automation",
