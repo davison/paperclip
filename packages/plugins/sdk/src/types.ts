@@ -1127,6 +1127,9 @@ export interface PluginIssuesClient {
     executionWorkspaceId?: string | null;
     executionWorkspacePreference?: string | null;
     executionWorkspaceSettings?: Record<string, unknown> | null;
+    /** When set, the issue is created with `hiddenAt` so it does not appear in
+     *  default human-facing list views (system-kind issues, RED-163). */
+    hiddenAt?: Date | string | null;
     actor?: PluginIssueMutationActor;
   }): Promise<Issue>;
   update(

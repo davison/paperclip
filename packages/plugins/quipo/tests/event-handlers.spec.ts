@@ -150,6 +150,86 @@ describe("Quipo event handlers — issue.comment.created", () => {
     expect(extraction!.description).toContain(commentId);
     expect(extraction!.description).toContain("We agreed to use TypeScript");
     expect(extraction!.originKind).toBe(`plugin:${manifest.id}`);
+    // RED-163: extraction issues are created hidden so they do not pollute
+    // the human-facing default `/issues` list view. The server's
+    // `?includeHidden=true` filter is the admin opt-in for diagnostics.
+    expect(extraction!.hiddenAt).toBeInstanceOf(Date);
+  });
+
+  it("RED-163: batches a second comment on the same source into the open extraction (no second issue)", async () => {
+    const { commentId: firstCommentId } = await emitCommentCreated(harness);
+    const allAfterFirst = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const firstExtraction = allAfterFirst.find((issue) => issue.originId === `comment:${firstCommentId}`);
+    expect(firstExtraction).toBeDefined();
+
+    // Fresh comment on the same source — must NOT create a second extraction
+    // issue; must append to the existing one as a batched comment.
+    const { commentId: secondCommentId } = await emitCommentCreated(harness);
+    expect(secondCommentId).not.toBe(firstCommentId);
+
+    const allAfterSecond = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = allAfterSecond.filter(
+      (issue) =>
+        issue.originKind === `plugin:${manifest.id}` &&
+        typeof issue.originId === "string" &&
+        issue.originId.startsWith("comment:"),
+    );
+    expect(extractions).toHaveLength(1);
+    expect(extractions[0].id).toBe(firstExtraction!.id);
+
+    const comments = await harness.ctx.issues.listComments(firstExtraction!.id, COMPANY_ID);
+    const batched = comments.find((c) => c.body.includes(`comment id: ${secondCommentId}`));
+    expect(batched, "second comment must be appended as a batched comment").toBeDefined();
+    expect(batched!.body).toContain("batched into the same extraction");
+  });
+
+  it("RED-163: dedupes per (sourceIssueId, commentId) — replayed second-comment events do not re-append", async () => {
+    await emitCommentCreated(harness);
+    const sharedSecondCommentId = randomUUID();
+    await emitCommentCreated(harness, { commentId: sharedSecondCommentId });
+    // Replay of the same second-comment event (at-least-once redelivery).
+    await emitCommentCreated(harness, { commentId: sharedSecondCommentId });
+
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all.filter(
+      (issue) =>
+        issue.originKind === `plugin:${manifest.id}` &&
+        typeof issue.originId === "string" &&
+        issue.originId.startsWith("comment:"),
+    );
+    expect(extractions).toHaveLength(1);
+    const comments = await harness.ctx.issues.listComments(extractions[0].id, COMPANY_ID);
+    const batchedForReplay = comments.filter((c) =>
+      c.body.includes(`comment id: ${sharedSecondCommentId}`),
+    );
+    expect(batchedForReplay).toHaveLength(1);
+  });
+
+  it("RED-163: opens a fresh extraction after the previous one closes", async () => {
+    const { commentId: firstCommentId } = await emitCommentCreated(harness);
+    const allAfterFirst = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const firstExtraction = allAfterFirst.find((issue) => issue.originId === `comment:${firstCommentId}`);
+    expect(firstExtraction).toBeDefined();
+
+    // Simulate a successful harvest that closes the extraction issue and
+    // clears the per-source state (the close path inside `closeExtractionIssue`
+    // does this via the link record).
+    await harness.ctx.issues.update(firstExtraction!.id, { status: "done" }, COMPANY_ID, {
+      actorAgentId: MEMORY_AGENT_ID,
+    });
+    await harness.ctx.state.delete({
+      scopeKind: "instance",
+      namespace: "extractions",
+      stateKey: `source:${SOURCE_ISSUE_ID}`,
+    });
+
+    // The next fact-bearing comment on the same source must open a fresh
+    // extraction, not silently disappear.
+    const { commentId: laterCommentId } = await emitCommentCreated(harness);
+    const allAfterLater = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const laterExtraction = allAfterLater.find((issue) => issue.originId === `comment:${laterCommentId}`);
+    expect(laterExtraction).toBeDefined();
+    expect(laterExtraction!.id).not.toBe(firstExtraction!.id);
   });
 
   it("is idempotent: repeat events for the same comment do not duplicate the extraction issue", async () => {
@@ -286,9 +366,12 @@ describe("Quipo event handlers — issue.updated", () => {
     expect(extractions).toHaveLength(1);
   });
 
-  it("re-extracts when the source issue is genuinely updated again (new updatedAt)", async () => {
-    // Sanity check the new key: a *new* logical update should produce a new
-    // extraction even though the source issue id is the same.
+  it("batches a second genuine update into the same open extraction (RED-163)", async () => {
+    // RED-163: while an extraction issue for this source is still open, a
+    // *new* logical update on the same source must NOT spawn a second
+    // extraction — it must be folded into the open one as an additional
+    // comment. The memory-worker re-reads the issue body on its next wake
+    // and harvests all batched patches together.
     await emitIssueUpdated(harness, { patch: { title: "First rename" } });
 
     // Re-seed the source issue with a later updatedAt to simulate a real
@@ -302,6 +385,49 @@ describe("Quipo event handlers — issue.updated", () => {
     const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
     const extractions = all.filter((issue) =>
       typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(extractions).toHaveLength(1);
+    // The second update should appear as an appended comment on the open
+    // extraction issue.
+    const [openExtraction] = extractions;
+    const comments = await harness.ctx.issues.listComments(openExtraction.id, COMPANY_ID);
+    const appendedFromUpdate = comments.find((c) => c.body.includes("batched into the same extraction"));
+    expect(appendedFromUpdate, "expected the second update to be appended as a batched comment").toBeDefined();
+  });
+
+  it("re-extracts after the previous extraction is closed (RED-163)", async () => {
+    // Once the memory-worker harvests and the extraction issue flips to
+    // `done`, the per-source batch state must clear so the next update on
+    // the source opens a fresh extraction ticket.
+    await emitIssueUpdated(harness, { patch: { title: "First rename" } });
+    const all1 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const first = all1.find(
+      (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(first, "first extraction issue must exist").toBeDefined();
+
+    // Simulate a successful harvest closing the issue.
+    await harness.ctx.issues.update(first!.id, { status: "done" }, COMPANY_ID, {
+      actorAgentId: MEMORY_AGENT_ID,
+    });
+    // Clear the per-source state via the public state API the way the close
+    // path does — the harness's `update` does not run plugin event handlers.
+    await harness.ctx.state.delete({
+      scopeKind: "instance",
+      namespace: "extractions",
+      stateKey: `source:${SOURCE_ISSUE_ID}`,
+    });
+
+    // A genuinely new logical update on the (now-quiet) source should open a
+    // fresh extraction.
+    const later = new Date(Date.now() + 60_000);
+    harness.seed({
+      issues: [makeIssue({ updatedAt: later, title: "Renamed again" })],
+    });
+    await emitIssueUpdated(harness, { patch: { title: "Renamed again" } });
+    const all2 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all2.filter(
+      (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
     );
     expect(extractions).toHaveLength(2);
   });

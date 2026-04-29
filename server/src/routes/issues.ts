@@ -974,6 +974,8 @@ export function issueRoutes(
       excludeRoutineExecutions:
         req.query.excludeRoutineExecutions === "true" || req.query.excludeRoutineExecutions === "1",
       includeBlockedBy: req.query.includeBlockedBy === "true" || req.query.includeBlockedBy === "1",
+      includeHidden:
+        req.query.includeHidden === "true" || req.query.includeHidden === "1",
       q: req.query.q as string | undefined,
       limit,
       offset,

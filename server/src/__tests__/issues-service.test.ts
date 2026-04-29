@@ -2330,3 +2330,77 @@ describeEmbeddedPostgres("issueService.clearExecutionRunIfTerminal", () => {
     expect(row).toEqual({ executionRunId: null, executionLockedAt: null });
   });
 });
+
+describeEmbeddedPostgres("issueService.list includeHidden filter (RED-163)", () => {
+  let db!: ReturnType<typeof createDb>;
+  let svc!: ReturnType<typeof issueService>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-issues-includehidden-");
+    db = createDb(tempDb.connectionString);
+    svc = issueService(db);
+    await ensureIssueRelationsTable(db);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(issueComments);
+    await db.delete(issueRelations);
+    await db.delete(issueInboxArchives);
+    await db.delete(activityLog);
+    await db.delete(issues);
+    await db.delete(executionWorkspaces);
+    await db.delete(projectWorkspaces);
+    await db.delete(projects);
+    await db.delete(goals);
+    await db.delete(agents);
+    await db.delete(instanceSettings);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("excludes hidden issues from default list and surfaces them only when includeHidden=true", async () => {
+    const companyId = randomUUID();
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix: `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+
+    const visibleIssueId = randomUUID();
+    const hiddenIssueId = randomUUID();
+    await db.insert(issues).values([
+      {
+        id: visibleIssueId,
+        companyId,
+        title: "Visible human-facing issue",
+        status: "todo",
+        priority: "medium",
+        originKind: "manual",
+      },
+      {
+        id: hiddenIssueId,
+        companyId,
+        title: "Hidden Quipo extraction issue",
+        status: "todo",
+        priority: "low",
+        originKind: "manual",
+        hiddenAt: new Date(),
+      },
+    ]);
+
+    const defaultList = await svc.list(companyId, {});
+    const defaultIds = defaultList.map((row) => row.id);
+    expect(defaultIds).toContain(visibleIssueId);
+    expect(defaultIds).not.toContain(hiddenIssueId);
+
+    const adminList = await svc.list(companyId, { includeHidden: true });
+    const adminIds = adminList.map((row) => row.id);
+    expect(adminIds).toContain(visibleIssueId);
+    expect(adminIds).toContain(hiddenIssueId);
+  });
+});
