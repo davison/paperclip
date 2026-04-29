@@ -91,6 +91,24 @@ function emptySourceState(): ExtractionSourceState {
   return { openExtractionIssueId: null, batchedCommentIds: [], batchedUpdateOriginIds: [] };
 }
 
+/**
+ * Cap on per-source dedupe arrays (RED-173).
+ *
+ * The arrays are a cross-process fallback dedupe — the primary dedupe is
+ * per-comment / per-update `idempotencyStateKey`. Bounding to the most-recent
+ * N entries keeps state size and `.includes()` cost constant for long-lived
+ * open extraction issues on high-volume sources, while still covering any
+ * realistic at-least-once redelivery window. An open extraction issue closing
+ * resets these arrays, so the cap only matters within a single open window.
+ */
+export const MAX_BATCHED_DEDUPE_ENTRIES = 1024;
+
+function appendBoundedDedupe(existing: readonly string[], next: string): string[] {
+  const appended = existing.length === 0 ? [next] : [...existing, next];
+  if (appended.length <= MAX_BATCHED_DEDUPE_ENTRIES) return appended;
+  return appended.slice(appended.length - MAX_BATCHED_DEDUPE_ENTRIES);
+}
+
 async function readSourceState(
   ctx: PluginContext,
   sourceIssueId: string,
@@ -364,7 +382,7 @@ export async function enqueueCommentExtraction(
       await writeSourceState(ctx, sourceIssue.id, {
         ...sourceState,
         openExtractionIssueId,
-        batchedCommentIds: [...sourceState.batchedCommentIds, commentId],
+        batchedCommentIds: appendBoundedDedupe(sourceState.batchedCommentIds, commentId),
       });
 
       // Anchor per-comment idempotency to the existing extraction issue so a
@@ -650,7 +668,7 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
       await writeSourceState(ctx, sourceIssue.id, {
         ...sourceState,
         openExtractionIssueId,
-        batchedUpdateOriginIds: [...sourceState.batchedUpdateOriginIds, originId],
+        batchedUpdateOriginIds: appendBoundedDedupe(sourceState.batchedUpdateOriginIds, originId),
       });
 
       await ctx.state.set(idempotencyStateKey(originId), {

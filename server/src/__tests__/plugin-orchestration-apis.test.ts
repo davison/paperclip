@@ -218,6 +218,55 @@ describeEmbeddedPostgres("plugin orchestration APIs", () => {
     expect(visibleStored?.hiddenAt).toBeNull();
   });
 
+  it("enforces strict ISO-8601 grammar for hiddenAt and rejects locale/RFC2822 variants (RED-173 follow-up)", async () => {
+    const { companyId } = await seedCompanyAndAgent();
+    const services = buildHostServices(db, "plugin-record-id", "paperclip.missions", createEventBusStub());
+
+    // Permissive `new Date(...)` would silently accept all of these. The
+    // strict validator must reject them so plugin contracts stay
+    // deterministic across runtimes.
+    const ambiguous = [
+      "Wed, 29 Apr 2026 10:00:00 GMT", // RFC2822
+      "04/29/2026", // US locale
+      "29-04-2026", // EU locale
+      "2026-04-29", // bare date (no time + zone)
+      "2026-04-29 10:00:00Z", // space-separated, missing T
+      "2026-04-29T10:00:00", // missing timezone
+      "2026-13-01T10:00:00Z", // impossible month
+      "2026-02-30T10:00:00Z", // impossible day (Feb 30)
+      "2026-04-29T25:00:00Z", // impossible hour
+    ];
+    for (const value of ambiguous) {
+      await expect(
+        services.issues.create({
+          companyId,
+          title: `Reject ${value}`,
+          hiddenAt: value as any,
+        }),
+      ).rejects.toThrow(/hiddenAt must be a valid ISO timestamp/);
+    }
+
+    // Strict ISO with non-Z offset should be accepted and normalised to UTC.
+    const offsetIssue = await services.issues.create({
+      companyId,
+      title: "Offset hiddenAt",
+      hiddenAt: "2026-04-29T12:00:00+02:00" as any,
+    });
+    const [offsetStored] = await db.select().from(issues).where(eq(issues.id, offsetIssue.id));
+    expect(offsetStored?.hiddenAt).toBeInstanceOf(Date);
+    expect(offsetStored?.hiddenAt?.toISOString()).toBe("2026-04-29T10:00:00.000Z");
+
+    // ISO with fractional seconds (millisecond + sub-millisecond) and Z zone
+    // is accepted and normalises through Date.UTC(...) cleanly.
+    const fracIssue = await services.issues.create({
+      companyId,
+      title: "Fractional hiddenAt",
+      hiddenAt: "2026-04-29T12:00:00.123Z" as any,
+    });
+    const [fracStored] = await db.select().from(issues).where(eq(issues.id, fracIssue.id));
+    expect(fracStored?.hiddenAt?.toISOString()).toBe("2026-04-29T12:00:00.123Z");
+  });
+
   it("asserts checkout ownership for run-scoped plugin actions", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

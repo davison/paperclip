@@ -290,6 +290,43 @@ const UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3
 const PATH_LIKE_PATTERN = /[\\/]/;
 const WINDOWS_DRIVE_PATH_PATTERN = /^[A-Za-z]:[\\/]/;
 
+// Strict ISO-8601 date-time grammar: `YYYY-MM-DDTHH:MM:SS(.fff…)?(Z|±HH:MM)`.
+// Matches the calendar-date / 24-hour-time profile that our plugin contracts
+// require — explicitly rejects RFC2822, locale-specific, "YYYY-MM-DD"-only, and
+// missing-timezone variants that `new Date(...)` would otherwise accept.
+const ISO_8601_TIMESTAMP_PATTERN =
+  /^(\d{4})-(0[1-9]|1[0-2])-(0[1-9]|[12]\d|3[01])T([01]\d|2[0-3]):([0-5]\d):([0-5]\d)(?:\.(\d{1,9}))?(Z|([+-])([01]\d|2[0-3]):([0-5]\d))$/;
+
+export function parseStrictIso8601(value: string): Date | null {
+  const match = ISO_8601_TIMESTAMP_PATTERN.exec(value);
+  if (!match) return null;
+  const [, y, mo, d, hh, mm, ss, fracRaw, tz, sign, offH, offM] = match;
+  const year = Number(y);
+  const month = Number(mo);
+  const day = Number(d);
+  const hour = Number(hh);
+  const minute = Number(mm);
+  const second = Number(ss);
+  const millis = fracRaw ? Number(fracRaw.padEnd(3, "0").slice(0, 3)) : 0;
+  // Construct from components in UTC and verify the calendar round-trips
+  // exactly. Catches silent normalisation by V8 like 2026-02-30 → 2026-03-02
+  // that the regex shape would otherwise allow.
+  const calendar = new Date(Date.UTC(year, month - 1, day, hour, minute, second, millis));
+  if (
+    calendar.getUTCFullYear() !== year
+    || calendar.getUTCMonth() !== month - 1
+    || calendar.getUTCDate() !== day
+    || calendar.getUTCHours() !== hour
+    || calendar.getUTCMinutes() !== minute
+    || calendar.getUTCSeconds() !== second
+  ) {
+    return null;
+  }
+  if (tz === "Z") return calendar;
+  const offsetMinutes = (Number(offH) * 60 + Number(offM)) * (sign === "+" ? 1 : -1);
+  return new Date(calendar.getTime() - offsetMinutes * 60_000);
+}
+
 function looksLikePath(value: string): boolean {
   const normalized = value.trim();
   return (
@@ -1037,8 +1074,14 @@ export function buildHostServices(
         if (hiddenAt === null) {
           normalizedHiddenAt = null;
         } else if (typeof hiddenAt === "string" && hiddenAt.length > 0) {
-          const parsed = new Date(hiddenAt);
-          if (Number.isNaN(parsed.getTime())) {
+          // RED-173: enforce strict ISO-8601 (date-time with timezone). The
+          // permissive `new Date(s)` parser accepts RFC2822 / locale-dependent
+          // strings and silently normalises calendar-impossible dates (e.g.
+          // 2026-02-30 → 2026-03-02). Reject anything that does not match the
+          // ISO grammar AND round-trip through the calendar exactly, so plugin
+          // contracts stay deterministic across runtimes.
+          const parsed = parseStrictIso8601(hiddenAt);
+          if (!parsed) {
             throw new Error(
               `Plugin issues.create: hiddenAt must be a valid ISO timestamp string (received ${JSON.stringify(hiddenAt)})`,
             );

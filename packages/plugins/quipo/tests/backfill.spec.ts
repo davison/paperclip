@@ -198,7 +198,7 @@ describe("Quipo backfill — happy path", () => {
     // The second ISSUE_A comment must show up as an appended batched comment
     // on the (single) ISSUE_A extraction issue.
     const issueAExtraction = extractions.find((ex) =>
-      ex.description.includes(`source issue: ${ISSUE_A}`),
+      ex.description?.includes(`source issue: ${ISSUE_A}`),
     );
     expect(issueAExtraction, "ISSUE_A extraction issue must exist").toBeDefined();
     const aComments = await harness.ctx.issues.listComments(issueAExtraction!.id, COMPANY_ID);
