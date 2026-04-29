@@ -545,6 +545,33 @@ async function readPackageJson(
  *
  * @see PLUGIN_SPEC.md §10 — Package Contract
  */
+/**
+ * Containment check: returns true if `candidate` resolves to a location at or
+ * beneath `packageRoot`.
+ *
+ * Used as a trust boundary when the host process performs a dynamic `import()`
+ * of a plugin-controlled path (e.g. the capability-drift diagnostic). A plugin
+ * package.json may declare a `paperclipPlugin.manifest` value that escapes the
+ * package root via `..` segments or an absolute path; without containment the
+ * host would import arbitrary modules from outside the plugin package and
+ * execute their top-level code. Symlinks are deliberately not followed here —
+ * we only enforce the lexical relationship — because `realpath` would force
+ * the file to exist and we want to reject paths before any disk access.
+ */
+export function isManifestWithinPackageRoot(
+  packageRoot: string,
+  candidate: string,
+): boolean {
+  const root = path.resolve(packageRoot);
+  const target = path.resolve(candidate);
+  if (target === root) return true;
+  const rel = path.relative(root, target);
+  if (rel === "" || rel === ".") return true;
+  if (rel.startsWith("..")) return false;
+  if (path.isAbsolute(rel)) return false;
+  return true;
+}
+
 function resolveManifestPath(
   packageRoot: string,
   pkgJson: Record<string, unknown>,
@@ -1992,6 +2019,23 @@ async function warnIfManifestCapabilityDrift(
     if (!pkgJson) return;
     const manifestPath = resolveManifestPath(packageRoot, pkgJson);
     if (!manifestPath || !existsSync(manifestPath)) return;
+
+    // Trust boundary: refuse to import a manifest path that escapes the plugin
+    // package root. Without this guard a malicious or misconfigured
+    // `paperclipPlugin.manifest` (e.g. `../../../etc/...` or an absolute path
+    // outside the package) could cause the host to dynamically import and
+    // execute arbitrary modules during activation.
+    if (!isManifestWithinPackageRoot(packageRoot, manifestPath)) {
+      log.debug(
+        {
+          pluginId: plugin.id,
+          packageRoot,
+          manifestPath,
+        },
+        "plugin-loader: capability-drift check skipped (manifest path escapes package root)",
+      );
+      return;
+    }
 
     let onDiskRaw: unknown;
     try {
