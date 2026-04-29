@@ -336,31 +336,41 @@ export async function enqueueCommentExtraction(
     }
 
     const sourceState = await readSourceState(ctx, sourceIssue.id);
-    if (sourceState.batchedCommentIds.includes(commentId)) {
-      // Source-state already records this comment as folded into the open
-      // extraction issue. This is the cross-process / cross-restart fallback
-      // when the per-comment idempotency state was lost (e.g. crash between
-      // append and `state.set(idempotencyStateKey)`).
-      return {
-        status: "already_extracted",
-        extractionIssueId: sourceState.openExtractionIssueId,
-        originId,
-      } as const;
-    }
 
-    const identifier = identifierHint ?? sourceIssue.identifier ?? sourceIssue.id;
-    const titlePrefix = sourceKind === "backfill" ? "Quipo backfill" : "Quipo";
-    const snippetBlock = quote((bodySnippet ?? "").slice(0, 240));
-
-    // RED-163 batching: if there is already an open extraction issue for this
-    // source, append the new comment to its description instead of opening a
-    // fresh ticket. The memory-worker re-reads the issue body on its next
-    // wake and will harvest all batched snippets together.
+    // RED-163 batching: resolve the linked extraction first so the batched-id
+    // short-circuit below can validate the extraction is still open before
+    // treating this event as already extracted. Without that validation, a
+    // close-time race or partial failure that left a stale batched id pointing
+    // at a closed/cancelled/blocked extraction would silently drop the event.
     const openExtractionIssueId = await resolveOpenExtractionIssueId(
       ctx,
       companyId,
       sourceState,
     );
+
+    if (openExtractionIssueId && sourceState.batchedCommentIds.includes(commentId)) {
+      // Source-state already records this comment as folded into the still-open
+      // extraction issue. Cross-process / cross-restart fallback when the
+      // per-comment idempotency state was lost (e.g. crash between append and
+      // `state.set(idempotencyStateKey)`).
+      return {
+        status: "already_extracted",
+        extractionIssueId: openExtractionIssueId,
+        originId,
+      } as const;
+    }
+    // RED-173: if `openExtractionIssueId` is null the linked extraction has
+    // closed/cancelled/blocked since we last wrote state — any stale batched
+    // id is no longer authoritative. Fall through and open a fresh extraction
+    // rather than dropping the event.
+
+    const identifier = identifierHint ?? sourceIssue.identifier ?? sourceIssue.id;
+    const titlePrefix = sourceKind === "backfill" ? "Quipo backfill" : "Quipo";
+    const snippetBlock = quote((bodySnippet ?? "").slice(0, 240));
+
+    // If the resolved extraction is still open, append the new comment to it
+    // instead of opening a fresh ticket. The memory-worker re-reads the issue
+    // body on its next wake and harvests all batched snippets together.
     if (openExtractionIssueId) {
       const appendBody = [
         `Additional comment on ${identifier} (batched into the same extraction):`,
@@ -628,24 +638,36 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
     }
 
     const sourceState = await readSourceState(ctx, sourceIssue.id);
-    if (sourceState.batchedUpdateOriginIds.includes(originId)) {
+
+    // RED-163 batching: resolve the linked extraction first so the batched-id
+    // short-circuit below can validate the extraction is still open before
+    // treating this event as already extracted. RED-173: without that
+    // validation, a close-time race or partial failure that left a stale
+    // batched origin id pointing at a closed/cancelled/blocked extraction
+    // would silently drop the event.
+    const openExtractionIssueId = await resolveOpenExtractionIssueId(
+      ctx,
+      event.companyId,
+      sourceState,
+    );
+
+    if (openExtractionIssueId && sourceState.batchedUpdateOriginIds.includes(originId)) {
       // Cross-process / cross-restart fallback: source-state already records
-      // this update originId as folded into the open extraction issue.
+      // this update originId as folded into the still-open extraction issue.
       return;
     }
+    // RED-173: if `openExtractionIssueId` is null the linked extraction has
+    // closed since we wrote state — any stale batched id is no longer
+    // authoritative. Fall through and open a fresh extraction rather than
+    // dropping the event.
 
     const identifier = payload.identifier ?? sourceIssue.identifier ?? sourceIssue.id;
     const patchSummary = JSON.stringify(payload.patch ?? {});
     const updatedAtIso =
       sourceIssue.updatedAt instanceof Date ? sourceIssue.updatedAt.toISOString() : sourceIssue.updatedAt;
 
-    // RED-163 batching: if there is already an open extraction issue for this
-    // source, append the patch to it instead of opening a fresh ticket.
-    const openExtractionIssueId = await resolveOpenExtractionIssueId(
-      ctx,
-      event.companyId,
-      sourceState,
-    );
+    // If the resolved extraction is still open, append the patch to it instead
+    // of opening a fresh ticket.
     if (openExtractionIssueId) {
       const appendBody = [
         `Additional update on ${identifier} (batched into the same extraction):`,

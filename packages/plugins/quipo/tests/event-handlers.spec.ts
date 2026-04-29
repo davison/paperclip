@@ -11,6 +11,7 @@ import {
   extractionSourceStateKey,
   parseErrorCountStateKey,
   registerQuipoEventHandlers,
+  updateOriginId,
 } from "../src/event-handlers.js";
 
 const COMPANY_ID = "00000000-0000-0000-0000-00000000c0c0";
@@ -276,6 +277,44 @@ describe("Quipo event handlers — issue.comment.created", () => {
     expect(stateAfter!.batchedCommentIds).not.toContain(firstCommentId);
   });
 
+  it("RED-173: re-queues a comment when the linked extraction has closed and per-source state was not cleared (partial-failure recovery)", async () => {
+    // Open an extraction so we have a real extraction issue id to point at.
+    const { commentId: firstCommentId } = await emitCommentCreated(harness);
+    const all1 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const firstExtraction = all1.find((issue) => issue.originId === `comment:${firstCommentId}`);
+    expect(firstExtraction).toBeDefined();
+
+    // Close the extraction (simulate harvest) but DO NOT clear per-source
+    // state — simulates a close-time race / partial failure where
+    // `clearSourceBatchStateForExtraction` never ran. The pre-fix code would
+    // trust the stale `batchedCommentIds` membership and silently drop the
+    // next event for any matching id, dropping fact-bearing extraction work.
+    await harness.ctx.issues.update(firstExtraction!.id, { status: "done" }, COMPANY_ID, {
+      actorAgentId: MEMORY_AGENT_ID,
+    });
+
+    // Pre-fill stale source-state: openExtractionIssueId points at the now-
+    // closed extraction; batchedCommentIds includes a replayed commentId for
+    // which per-comment idempotency state has been lost (matching the cross-
+    // process / cross-restart fallback rationale this branch was designed for).
+    const replayedCommentId = randomUUID();
+    await harness.ctx.state.set(extractionSourceStateKey(SOURCE_ISSUE_ID), {
+      openExtractionIssueId: firstExtraction!.id,
+      batchedCommentIds: [firstCommentId, replayedCommentId],
+      batchedUpdateOriginIds: [],
+    });
+
+    await emitCommentCreated(harness, { commentId: replayedCommentId });
+
+    const all2 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const matching = all2.filter((issue) => issue.originId === `comment:${replayedCommentId}`);
+    expect(
+      matching,
+      "fresh extraction must open when the linked extraction is no longer processable",
+    ).toHaveLength(1);
+    expect(matching[0].id).not.toBe(firstExtraction!.id);
+  });
+
   it("is idempotent under concurrent delivery of the same comment", async () => {
     // Two workers/processes can race the get→create→set sequence. Without an
     // in-process claim lock + pre-create dedupe, each concurrent delivery
@@ -466,6 +505,51 @@ describe("Quipo event handlers — issue.updated", () => {
       (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
     );
     expect(extractions).toHaveLength(2);
+  });
+
+  it("RED-173: re-queues an update when the linked extraction has closed and per-source state was not cleared (partial-failure recovery)", async () => {
+    // Open an extraction.
+    await emitIssueUpdated(harness, { patch: { title: "First rename" } });
+    const all1 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const first = all1.find(
+      (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(first).toBeDefined();
+
+    // Close the extraction without clearing per-source state — simulates a
+    // close-time race / partial failure where cleanup never ran.
+    await harness.ctx.issues.update(first!.id, { status: "done" }, COMPANY_ID, {
+      actorAgentId: MEMORY_AGENT_ID,
+    });
+
+    // Re-seed the source with a later updatedAt and pre-load stale source
+    // state where `batchedUpdateOriginIds` already contains the originId the
+    // next event will produce. Pre-fix the handler would short-circuit on
+    // membership alone and drop the event despite the linked extraction being
+    // closed.
+    const later = new Date(Date.now() + 60_000);
+    harness.seed({
+      issues: [makeIssue({ updatedAt: later, title: "Renamed again" })],
+    });
+    const replayedOriginId = updateOriginId(SOURCE_ISSUE_ID, later);
+    await harness.ctx.state.set(extractionSourceStateKey(SOURCE_ISSUE_ID), {
+      openExtractionIssueId: first!.id,
+      batchedCommentIds: [],
+      batchedUpdateOriginIds: [replayedOriginId],
+    });
+
+    await emitIssueUpdated(harness, { patch: { title: "Renamed again" } });
+
+    const all2 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all2.filter(
+      (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    // Two distinct extraction issues: the original (now done) and a fresh one
+    // for the replayed update.
+    expect(extractions).toHaveLength(2);
+    const replayed = extractions.find((issue) => issue.originId === replayedOriginId);
+    expect(replayed, "fresh extraction must open when linked one is closed").toBeDefined();
+    expect(replayed!.id).not.toBe(first!.id);
   });
 
   it("is idempotent under concurrent delivery of the same logical update", async () => {
