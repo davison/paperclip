@@ -556,10 +556,24 @@ async function readPackageJson(
  *
  * @see PLUGIN_SPEC.md §10 — Package Contract
  */
-function resolveManifestPath(
+export function resolveManifestPath(
   packageRoot: string,
   pkgJson: Record<string, unknown>,
 ): string | null {
+  // Enforce that any resolved manifest path remains within packageRoot.
+  // The host dynamically `import()`s this path during activation/drift checks,
+  // so a `..`-escaping or absolute-path manifest pointer in package.json could
+  // execute arbitrary host-process module top-level code from outside the
+  // plugin package. This is the trust-boundary control: a manifest pointer
+  // that escapes its package root is treated as no manifest at all.
+  const normalizedRoot = path.resolve(packageRoot);
+  const isInsideRoot = (candidate: string): boolean => {
+    const resolved = path.resolve(candidate);
+    if (resolved === normalizedRoot) return true;
+    const rel = path.relative(normalizedRoot, resolved);
+    return rel !== "" && !rel.startsWith("..") && !path.isAbsolute(rel);
+  };
+
   const paperclipPlugin = pkgJson["paperclipPlugin"];
   if (
     paperclipPlugin !== null &&
@@ -570,10 +584,25 @@ function resolveManifestPath(
       "manifest"
     ];
     if (typeof manifestRelPath === "string") {
+      const candidate = path.resolve(packageRoot, manifestRelPath);
+      if (!isInsideRoot(candidate)) {
+        logger.warn(
+          {
+            service: "plugin-loader",
+            packageRoot: normalizedRoot,
+            manifestRelPath,
+            resolvedManifestPath: candidate,
+          },
+          "plugin-loader: package.json paperclipPlugin.manifest pointer " +
+            "escapes the package root; refusing to resolve. The manifest " +
+            "must live inside its own package directory.",
+        );
+        return null;
+      }
       // NOTE: the resolved path is returned as-is even if the file does not yet
       // exist on disk (e.g. the package has not been built).  Callers MUST guard
       // with existsSync() before passing the path to loadManifestFromPath().
-      return path.resolve(packageRoot, manifestRelPath);
+      return candidate;
     }
   }
 
