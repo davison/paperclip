@@ -86,14 +86,20 @@ export function createPluginBundlerPresets(input: PluginBundlerPresetInput = {})
     external: ["react", "react-dom"],
   };
 
+  // Manifest is bundled so dist/manifest.js is self-contained: dynamic
+  // import() at activation/upgrade time must not depend on sibling files
+  // that may or may not be emitted by tsc. Bundling collapses local
+  // helpers (tool declarations, schemas) into a single module while
+  // keeping host/runtime deps external.
   const esbuildManifest: EsbuildLikeOptions = {
     entryPoints: [manifestEntry],
     outdir,
-    bundle: false,
+    bundle: true,
     format: "esm",
     platform: "node",
     target: "node20",
     sourcemap,
+    external: ["@paperclipai/plugin-sdk", "@paperclipai/plugin-sdk/*"],
   };
 
   const esbuildUi = uiEntry

@@ -393,7 +393,18 @@ export interface PluginLoader {
    *
    * @see PLUGIN_SPEC.md §25.3 — Upgrade Lifecycle
    */
-  upgradePlugin(pluginId: string, options: Omit<PluginInstallOptions, "installDir">): Promise<{
+  upgradePlugin(
+    pluginId: string,
+    options: Omit<PluginInstallOptions, "installDir"> & {
+      /**
+       * Skip the capability-escalation guard and accept the new manifest as-is.
+       * Intended for trusted operator flows like the local dev-watcher where
+       * the manifest is author-controlled and capability changes are expected.
+       * Defaults to `false` (production-safe behavior).
+       */
+      allowCapabilityEscalation?: boolean;
+    },
+  ): Promise<{
     oldManifest: PaperclipPluginManifestV1;
     newManifest: PaperclipPluginManifestV1;
     discovered: DiscoveredPlugin;
@@ -922,6 +933,59 @@ export function pluginLoader(
   }
 
   /**
+   * Compare a plugin's persisted (DB) manifest against the manifest on disk
+   * and emit a warning when key fields drift. Limited to local-path installs
+   * because npm-installed packages are pinned by version and shouldn't drift
+   * underneath the host. Non-fatal: drift means an operator forgot to call
+   * /upgrade or reactivate, but the live host still enforces the DB row.
+   */
+  async function warnIfManifestDrift(
+    plugin: PluginRecord,
+    packageRoot: string,
+  ): Promise<void> {
+    if (!plugin.packagePath) return;
+    if (!existsSync(packageRoot)) return;
+
+    const pkgJson = await readPackageJson(packageRoot);
+    if (!pkgJson) return;
+    const manifestPath = resolveManifestPath(packageRoot, pkgJson);
+    if (!manifestPath || !existsSync(manifestPath)) return;
+
+    let onDisk: PaperclipPluginManifestV1;
+    try {
+      onDisk = await loadManifestFromPath(manifestPath);
+    } catch {
+      return; // Build artifact missing or invalid — not a drift signal
+    }
+
+    const dbManifest = plugin.manifestJson;
+    const dbCaps = new Set(dbManifest.capabilities ?? []);
+    const diskCaps = new Set(onDisk.capabilities ?? []);
+    const onlyOnDisk = [...diskCaps].filter((c) => !dbCaps.has(c));
+    const onlyInDb = [...dbCaps].filter((c) => !diskCaps.has(c));
+    const versionDrift = onDisk.version !== dbManifest.version;
+
+    if (onlyOnDisk.length === 0 && onlyInDb.length === 0 && !versionDrift) {
+      return;
+    }
+
+    log.warn(
+      {
+        pluginId: plugin.id,
+        pluginKey: plugin.pluginKey,
+        manifestPath,
+        diskVersion: onDisk.version,
+        dbVersion: dbManifest.version,
+        capabilitiesOnlyOnDisk: onlyOnDisk,
+        capabilitiesOnlyInDb: onlyInDb,
+      },
+      "plugin-loader: on-disk manifest drifts from DB manifest_json — " +
+        "live host enforces the DB capabilities. Run /api/plugins/:id/upgrade " +
+        "(production) or trigger the dev-watcher reload to re-sync.",
+    );
+  }
+
+  /**
    * Attempt to load and validate a plugin manifest from a resolved path.
    * Returns the manifest on success or throws with a descriptive error.
    */
@@ -1298,7 +1362,9 @@ export function pluginLoader(
      */
     async upgradePlugin(
       pluginId: string,
-      upgradeOptions: Omit<PluginInstallOptions, "installDir">,
+      upgradeOptions: Omit<PluginInstallOptions, "installDir"> & {
+        allowCapabilityEscalation?: boolean;
+      },
     ): Promise<{
       oldManifest: PaperclipPluginManifestV1;
       newManifest: PaperclipPluginManifestV1;
@@ -1320,6 +1386,7 @@ export function pluginLoader(
         // the caller to re-supply the path every time.
         localPath = plugin.packagePath ?? undefined,
         version,
+        allowCapabilityEscalation = false,
       } = upgradeOptions;
 
       log.info(
@@ -1350,15 +1417,22 @@ export function pluginLoader(
       const escalated = newCaps.filter((c) => !oldCaps.has(c));
 
       if (escalated.length > 0) {
-        log.warn(
-          { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
-          "plugin-loader: upgrade introduces new capabilities — requires admin approval",
-        );
-        throw new Error(
-          `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
-            `The previous version declared [${[...oldCaps].join(", ")}]. ` +
-            `Please review and approve the capability escalation before upgrading.`,
-        );
+        if (allowCapabilityEscalation) {
+          log.warn(
+            { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
+            "plugin-loader: accepting capability escalation (allowCapabilityEscalation=true)",
+          );
+        } else {
+          log.warn(
+            { pluginId, escalated, oldVersion: oldManifest.version, newVersion: newManifest.version },
+            "plugin-loader: upgrade introduces new capabilities — requires admin approval",
+          );
+          throw new Error(
+            `Upgrade for "${pluginId}" introduces new capabilities that require approval: ${escalated.join(", ")}. ` +
+              `The previous version declared [${[...oldCaps].join(", ")}]. ` +
+              `Please review and approve the capability escalation before upgrading.`,
+          );
+        }
       }
 
       // 4. Update the existing record
@@ -1707,6 +1781,23 @@ export function pluginLoader(
       // ------------------------------------------------------------------
       const workerEntrypoint = resolveWorkerEntrypoint(plugin, localPluginDir);
       const packageRoot = resolvePluginPackageRoot(plugin, localPluginDir);
+
+      // ------------------------------------------------------------------
+      // 1a. Detect on-disk vs DB manifest drift (warning only).
+      //     Operators don't expect the live capability validator to enforce
+      //     a different capability set than the source declares — but the
+      //     DB's manifest_json is authoritative until upgrade() / reload
+      //     re-syncs it. Surface the discrepancy loudly so stale-manifest
+      //     plugins don't ship silently.
+      // ------------------------------------------------------------------
+      try {
+        await warnIfManifestDrift(plugin, packageRoot);
+      } catch (err) {
+        log.debug(
+          { pluginId, pluginKey, err: err instanceof Error ? err.message : String(err) },
+          "plugin-loader: manifest drift check failed (non-fatal)",
+        );
+      }
 
       // ------------------------------------------------------------------
       // 2. Apply restricted database migrations before worker startup

@@ -223,6 +223,27 @@ export interface PluginLifecycleManager {
   restartWorker(pluginId: string): Promise<void>;
 
   /**
+   * Re-read a local-path plugin's manifest from disk and fully reactivate
+   * the plugin, so the host capability validator and any other manifest-
+   * derived state are rebuilt from the new on-disk manifest.
+   *
+   * This is the dev-loop counterpart to `restartWorker`: a worker restart
+   * only re-execs the worker subprocess but leaves host-side handlers
+   * bound to the manifest captured at the previous activation. Manifest
+   * edits (capabilities, instanceConfigSchema, tool declarations, etc.)
+   * therefore require this fuller reactivation to take effect.
+   *
+   * Capability escalation is accepted: in dev the manifest is author-
+   * controlled. Production upgrades still go through `upgrade()` which
+   * preserves the operator-approval gate.
+   *
+   * @param pluginId - The UUID of the plugin to reload
+   * @throws if the plugin has no `packagePath` (i.e. is not a local install)
+   *         or if the plugin is not in a `ready` state.
+   */
+  reloadFromDisk(pluginId: string): Promise<PluginRecord>;
+
+  /**
    * Get the current lifecycle state for a plugin.
    */
   getStatus(pluginId: string): Promise<PluginStatus | null>;
@@ -790,6 +811,60 @@ export function pluginLifecycleManager(
         { pluginId, pluginKey: plugin.pluginKey },
         "plugin lifecycle: worker restarted",
       );
+    },
+
+    // -- reloadFromDisk ---------------------------------------------------
+    async reloadFromDisk(pluginId: string): Promise<PluginRecord> {
+      const plugin = await requirePlugin(pluginId);
+
+      if (!plugin.packagePath) {
+        throw badRequest(
+          `Cannot reloadFromDisk plugin "${plugin.pluginKey}": no packagePath set ` +
+            `(only local-path installs support manifest reload).`,
+        );
+      }
+
+      if (plugin.status !== "ready") {
+        throw badRequest(
+          `Cannot reloadFromDisk plugin in status '${plugin.status}'. ` +
+            `Plugin must be in 'ready' status to be reloaded.`,
+        );
+      }
+
+      log.info(
+        { pluginId, pluginKey: plugin.pluginKey, packagePath: plugin.packagePath },
+        "plugin lifecycle: reloading manifest from disk",
+      );
+
+      // 1. Tear down current runtime so the next activation rebuilds host
+      //    handlers from the freshly read manifest.
+      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
+
+      // 2. Re-read manifest from disk and persist the new manifest_json.
+      //    Dev-mode: capability escalation is accepted because the manifest
+      //    is author-controlled; production callers should use upgrade().
+      const { newManifest, discovered } = await pluginLoaderInstance.upgradePlugin(
+        pluginId,
+        { allowCapabilityEscalation: true },
+      );
+
+      // 3. Re-activate (rebuilds host handlers, re-subscribes events, etc.)
+      const result = await transition(pluginId, "ready", null, {
+        ...plugin,
+        version: discovered.version,
+        manifestJson: newManifest,
+      } as PluginRecord);
+      await activateReadyPlugin(pluginId);
+
+      emitDomain("plugin.loaded", { pluginId, pluginKey: result.pluginKey });
+      emitDomain("plugin.enabled", { pluginId, pluginKey: result.pluginKey });
+
+      log.info(
+        { pluginId, pluginKey: result.pluginKey, version: result.version },
+        "plugin lifecycle: manifest reloaded from disk and plugin reactivated",
+      );
+
+      return result;
     },
 
     // -- getStatus --------------------------------------------------------

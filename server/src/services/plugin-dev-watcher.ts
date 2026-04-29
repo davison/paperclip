@@ -50,6 +50,37 @@ type PluginWatchTarget = {
   kind: "file" | "dir";
 };
 
+/**
+ * Resolve the absolute path of the plugin's manifest entrypoint, if it can be
+ * determined from `package.json`. Returns `null` when the package has no
+ * `paperclipPlugin.manifest` declaration. Edits to this file (or to
+ * `package.json` itself, since it can change capabilities/config schema
+ * indirectly through pointer changes) should trigger a full plugin
+ * reactivation rather than a worker-only restart.
+ */
+export function resolvePluginManifestEntrypoint(
+  packagePath: string,
+  fsDeps?: Pick<PluginDevWatcherFsDeps, "existsSync" | "readFileSync">,
+): string | null {
+  const fileExists = fsDeps?.existsSync ?? existsSync;
+  const readFile = fsDeps?.readFileSync ?? readFileSync;
+  const absPath = path.resolve(packagePath);
+  const packageJsonPath = path.join(absPath, "package.json");
+  if (!fileExists(packageJsonPath)) return null;
+
+  let packageJson: PluginPackageJson | null = null;
+  try {
+    packageJson = JSON.parse(readFile(packageJsonPath, "utf8")) as PluginPackageJson;
+  } catch {
+    return null;
+  }
+
+  const manifestRel = packageJson?.paperclipPlugin?.manifest;
+  if (typeof manifestRel !== "string" || manifestRel.length === 0) return null;
+
+  return path.resolve(absPath, manifestRel);
+}
+
 type PluginPackageJson = {
   paperclipPlugin?: {
     manifest?: string;
@@ -163,6 +194,14 @@ export function createPluginDevWatcher(
 ): PluginDevWatcher {
   const watchers = new Map<string, FSWatcher>();
   const debounceTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /**
+   * Per-plugin flag tracking whether any of the changes coalesced into the
+   * pending debounce window touched the manifest (or package.json, which
+   * can move the manifest pointer). When set, we do a full reactivation so
+   * host-side capability validators and other manifest-derived state get
+   * rebuilt; otherwise we only restart the worker.
+   */
+  const pendingManifestReload = new Map<string, boolean>();
   const fileExists = fsDeps?.existsSync ?? existsSync;
 
   function watchPlugin(pluginId: string, packagePath: string): void {
@@ -188,6 +227,9 @@ export function createPluginDevWatcher(
         return;
       }
 
+      const manifestEntrypoint = resolvePluginManifestEntrypoint(absPath, fsDeps);
+      const packageJsonPath = path.resolve(absPath, "package.json");
+
       const watcher = chokidar.watch(
         watcherTargets.map((target) => target.path),
         {
@@ -207,6 +249,14 @@ export function createPluginDevWatcher(
         const relativePath = path.relative(absPath, changedPath);
         if (shouldIgnorePath(relativePath)) return;
 
+        const resolvedChanged = path.resolve(changedPath);
+        const isManifestChange =
+          (manifestEntrypoint != null && resolvedChanged === manifestEntrypoint)
+          || resolvedChanged === packageJsonPath;
+        if (isManifestChange) {
+          pendingManifestReload.set(pluginId, true);
+        }
+
         const existing = debounceTimers.get(pluginId);
         if (existing) clearTimeout(existing);
 
@@ -214,18 +264,32 @@ export function createPluginDevWatcher(
           pluginId,
           setTimeout(() => {
             debounceTimers.delete(pluginId);
+            const needsManifestReload = pendingManifestReload.get(pluginId) === true;
+            pendingManifestReload.delete(pluginId);
+
+            const changedFile = relativePath || path.basename(changedPath);
+            const action = needsManifestReload
+              ? "reloading plugin from disk"
+              : "restarting worker";
             log.info(
-              { pluginId, changedFile: relativePath || path.basename(changedPath) },
-              "plugin-dev-watcher: file change detected, restarting worker",
+              { pluginId, changedFile, manifestReload: needsManifestReload },
+              `plugin-dev-watcher: file change detected, ${action}`,
             );
 
-            lifecycle.restartWorker(pluginId).catch((err) => {
+            const reloadPromise = needsManifestReload
+              ? lifecycle.reloadFromDisk(pluginId).then(() => undefined)
+              : lifecycle.restartWorker(pluginId);
+
+            reloadPromise.catch((err) => {
               log.warn(
                 {
                   pluginId,
+                  manifestReload: needsManifestReload,
                   err: err instanceof Error ? err.message : String(err),
                 },
-                "plugin-dev-watcher: failed to restart worker after file change",
+                needsManifestReload
+                  ? "plugin-dev-watcher: failed to reload plugin after manifest change"
+                  : "plugin-dev-watcher: failed to restart worker after file change",
               );
             });
           }, DEBOUNCE_MS),
@@ -279,6 +343,7 @@ export function createPluginDevWatcher(
       clearTimeout(timer);
       debounceTimers.delete(pluginId);
     }
+    pendingManifestReload.delete(pluginId);
   }
 
   function close(): void {
