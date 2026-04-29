@@ -1,6 +1,12 @@
 import type { Issue, PluginContext, PluginEvent, ScopeKey } from "@paperclipai/plugin-sdk";
 
 import { QUIPO_PLUGIN_ID, readQuipoConfig } from "./config.js";
+import {
+  type ExtractionLink,
+  extractionLinkStateKey,
+  harvestExtraction,
+  harvestStateKey,
+} from "./harvest.js";
 
 const STATE_NAMESPACE = "extractions";
 const QUIPO_ORIGIN_KIND = `plugin:${QUIPO_PLUGIN_ID}` as const;
@@ -288,6 +294,15 @@ export async function enqueueCommentExtraction(
       source_comment_id: commentId,
     });
 
+    const link: ExtractionLink = {
+      sourceIssueId: sourceIssue.id,
+      sourceCommentId: commentId,
+      sourceKind,
+      peerAgentId: authorAgentId ?? null,
+      originId,
+    };
+    await ctx.state.set(extractionLinkStateKey(extractionIssue.id), link);
+
     ctx.logger.info("Quipo: queued comment fact extraction", {
       sourceIssueId: sourceIssue.id,
       commentId,
@@ -487,6 +502,15 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
       eventId: event.eventId,
     });
 
+    const updateLink: ExtractionLink = {
+      sourceIssueId: sourceIssue.id,
+      sourceCommentId: null,
+      sourceKind: "issue_update",
+      peerAgentId: payload.agentId ?? null,
+      originId,
+    };
+    await ctx.state.set(extractionLinkStateKey(extractionIssue.id), updateLink);
+
     ctx.logger.info("Quipo: queued issue-update fact extraction", {
       sourceIssueId: sourceIssue.id,
       extractionIssueId: extractionIssue.id,
@@ -502,7 +526,188 @@ export async function onIssueUpdated(ctx: PluginContext, event: PluginEvent): Pr
   });
 }
 
+interface MemoryWorkerCommentPayload {
+  commentId?: string;
+  bodySnippet?: string;
+  agentId?: string | null;
+  runId?: string | null;
+}
+
+/** Handler for comments posted by the memory-worker on plugin-owned
+ *  extraction issues. Parses the JSON body, persists facts/sessions/peer_models,
+ *  and flips the extraction issue to `done` so it does not linger.
+ *
+ *  Listens to the same `issue.comment.created` channel as
+ *  {@link onIssueCommentCreated}; the two paths are mutually exclusive
+ *  because comments authored by the memory-worker on a plugin-origin issue
+ *  are skipped by the source-extraction path. */
+export async function onMemoryWorkerComment(
+  ctx: PluginContext,
+  event: PluginEvent,
+): Promise<void> {
+  const payload = (event.payload ?? {}) as MemoryWorkerCommentPayload;
+  const commentId = payload.commentId;
+  if (!commentId) return;
+
+  const config = await getQuipoRuntimeConfig(ctx);
+  if (!config.enabled) return;
+  const memoryAgentId = config.memoryAgentId;
+  if (!memoryAgentId) return;
+
+  // Only process comments authored by the memory-worker.
+  if (!payload.agentId || payload.agentId !== memoryAgentId) return;
+
+  const sourceIssueId = event.entityId;
+  if (!sourceIssueId) return;
+
+  // Comments live on the extraction issue (plugin-owned); skip non-plugin
+  // issues fast.
+  const extractionIssue = await ctx.issues.get(sourceIssueId, event.companyId);
+  if (!extractionIssue) return;
+  if (!isQuipoOriginated(extractionIssue.originKind)) return;
+
+  // Recover source-context from the link record we wrote at create-time.
+  const link = (await ctx.state.get(extractionLinkStateKey(extractionIssue.id))) as
+    | ExtractionLink
+    | null
+    | undefined;
+  if (!link) {
+    ctx.logger.warn(
+      "Quipo: memory-worker comment on extraction issue with no stored link — skipping harvest",
+      { extractionIssueId: extractionIssue.id, commentId },
+    );
+    return;
+  }
+
+  // The event delivers a snippet, not the full body. Pull the canonical
+  // comment body via the host so a long fact list is not silently truncated.
+  // RED-169: do NOT fall back to `payload.bodySnippet` if the comment row is
+  // not yet visible — feeding a truncated snippet to the parser would persist
+  // a permanent `parse_error` outcome, and because state is keyed by
+  // commentId, the later retry with the full body would be skipped. Instead,
+  // bail without persisting state; the retry on `issue.updated` (when the
+  // memory-worker self-PATCHes the extraction issue to `done`) will pick it
+  // up once the comment has propagated.
+  const comments = await ctx.issues.listComments(extractionIssue.id, event.companyId);
+  const target = comments.find((c) => c.id === commentId);
+  if (!target) {
+    ctx.logger.warn(
+      "Quipo: memory-worker comment not yet visible — deferring harvest until issue.updated retry",
+      { extractionIssueId: extractionIssue.id, commentId },
+    );
+    return;
+  }
+  const fullBody = target.body ?? "";
+  if (!fullBody) {
+    ctx.logger.warn("Quipo: empty memory-worker comment body — skipping harvest", {
+      extractionIssueId: extractionIssue.id,
+      commentId,
+    });
+    return;
+  }
+
+  const result = await harvestExtraction(ctx, {
+    companyId: event.companyId,
+    commentBody: fullBody,
+    commentId,
+    extractionIssueId: extractionIssue.id,
+    link,
+    extractionRunId: payload.runId ?? null,
+  });
+
+  // Close the extraction issue when the harvest completed (including empty
+  // results — an empty {facts:[]} response is valid). Leave it open on
+  // parse_error so a human or follow-up retry can investigate.
+  if (
+    (result.status === "harvested" || result.status === "empty") &&
+    extractionIssue.status !== "done"
+  ) {
+    try {
+      await ctx.issues.update(
+        extractionIssue.id,
+        { status: "done" },
+        event.companyId,
+        { actorAgentId: memoryAgentId, actorRunId: payload.runId ?? null },
+      );
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      ctx.logger.debug("Quipo: could not close extraction issue (non-fatal)", {
+        extractionIssueId: extractionIssue.id,
+        detail,
+      });
+    }
+  }
+}
+
+/**
+ * Retry the harvest path for plugin-owned extraction issues on `issue.updated`.
+ *
+ * Why this exists (RED-169 fix #2): the live `issue.comment.created` event can
+ * fire before the comment row is visible to `ctx.issues.listComments`
+ * (eventual-consistency window between the comment-write and read replica).
+ * `onMemoryWorkerComment` deliberately bails without persisting state in that
+ * case, so something else has to re-trigger the harvest. The memory-worker
+ * self-PATCHes the extraction issue to `done` after posting its JSON comment,
+ * so by the time the resulting `issue.updated` arrives the comment is reliably
+ * visible. This handler scans memory-worker comments on the extraction issue
+ * and runs `harvestExtraction` for any that don't already have a recorded
+ * harvest state. `harvestExtraction` is idempotent on `commentId`, so any
+ * comment already harvested via the live path is a cheap state-read no-op.
+ */
+export async function onExtractionIssueUpdated(
+  ctx: PluginContext,
+  event: PluginEvent,
+): Promise<void> {
+  const extractionIssueId = event.entityId;
+  if (!extractionIssueId) return;
+
+  const config = await getQuipoRuntimeConfig(ctx);
+  if (!config.enabled) return;
+  const memoryAgentId = config.memoryAgentId;
+  if (!memoryAgentId) return;
+
+  const issue = await ctx.issues.get(extractionIssueId, event.companyId);
+  if (!issue) return;
+  if (!isQuipoOriginated(issue.originKind)) return;
+
+  // Only re-run harvest when we recognise the link record — filters out other
+  // plugin-origin issues we don't own.
+  const link = (await ctx.state.get(extractionLinkStateKey(issue.id))) as
+    | ExtractionLink
+    | null
+    | undefined;
+  if (!link) return;
+
+  const comments = await ctx.issues.listComments(issue.id, event.companyId);
+  for (const c of comments) {
+    if (c.authorAgentId !== memoryAgentId) continue;
+    if (!c.body) continue;
+
+    const existing = await ctx.state.get(harvestStateKey(c.id));
+    if (existing) continue;
+
+    await harvestExtraction(ctx, {
+      companyId: event.companyId,
+      commentBody: c.body,
+      commentId: c.id,
+      extractionIssueId: issue.id,
+      link,
+      extractionRunId: null,
+    });
+  }
+}
+
 export function registerQuipoEventHandlers(ctx: PluginContext): void {
   ctx.events.on("issue.comment.created", (event) => onIssueCommentCreated(ctx, event));
   ctx.events.on("issue.updated", (event) => onIssueUpdated(ctx, event));
+  // Harvest path: parse the memory-worker's JSON reply and persist facts.
+  // Lives on the same event channel as the source-extraction path; the two
+  // are mutually exclusive because comments authored by the memory-worker on
+  // a plugin-owned issue are skipped by the source-extraction handler above.
+  ctx.events.on("issue.comment.created", (event) => onMemoryWorkerComment(ctx, event));
+  // Retry harvest when an extraction issue is updated (eg. the memory-worker
+  // self-PATCHing to `done` after posting its JSON reply). Closes the
+  // eventual-consistency gap where the comment isn't yet visible at
+  // comment.created time.
+  ctx.events.on("issue.updated", (event) => onExtractionIssueUpdated(ctx, event));
 }
