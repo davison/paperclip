@@ -836,11 +836,11 @@ export function pluginLifecycleManager(
         "plugin lifecycle: reloading manifest from disk",
       );
 
-      // 1. Tear down current runtime so the next activation rebuilds host
-      //    handlers from the freshly read manifest.
-      await deactivatePluginRuntime(pluginId, plugin.pluginKey);
-
-      // 2. Re-read manifest from disk and persist the new manifest_json.
+      // 1. Re-read manifest from disk and persist the new manifest_json.
+      //    Run this BEFORE tearing down the runtime so that a manifest
+      //    read/validation failure leaves the plugin in its current
+      //    `ready` state with the worker still running — i.e. we never
+      //    deactivate before we know the new manifest is acceptable.
       //    Dev-mode: capability escalation is accepted because the manifest
       //    is author-controlled; production callers should use upgrade().
       const { newManifest, discovered } = await pluginLoaderInstance.upgradePlugin(
@@ -848,23 +848,59 @@ export function pluginLifecycleManager(
         { allowCapabilityEscalation: true },
       );
 
-      // 3. Re-activate (rebuilds host handlers, re-subscribes events, etc.)
-      const result = await transition(pluginId, "ready", null, {
-        ...plugin,
-        version: discovered.version,
-        manifestJson: newManifest,
-      } as PluginRecord);
-      await activateReadyPlugin(pluginId);
+      // 2. Tear down + re-activate. From this point on a failure means
+      //    runtime is down and DB has the new manifest; we must transition
+      //    out of `ready` so status reflects reality (worker not running).
+      try {
+        await deactivatePluginRuntime(pluginId, plugin.pluginKey);
 
-      emitDomain("plugin.loaded", { pluginId, pluginKey: result.pluginKey });
-      emitDomain("plugin.enabled", { pluginId, pluginKey: result.pluginKey });
+        const result = await transition(pluginId, "ready", null, {
+          ...plugin,
+          version: discovered.version,
+          manifestJson: newManifest,
+        } as PluginRecord);
+        await activateReadyPlugin(pluginId);
 
-      log.info(
-        { pluginId, pluginKey: result.pluginKey, version: result.version },
-        "plugin lifecycle: manifest reloaded from disk and plugin reactivated",
-      );
+        emitDomain("plugin.loaded", { pluginId, pluginKey: result.pluginKey });
+        emitDomain("plugin.enabled", { pluginId, pluginKey: result.pluginKey });
 
-      return result;
+        log.info(
+          { pluginId, pluginKey: result.pluginKey, version: result.version },
+          "plugin lifecycle: manifest reloaded from disk and plugin reactivated",
+        );
+
+        return result;
+      } catch (err) {
+        const errMessage = err instanceof Error ? err.message : String(err);
+        log.error(
+          { pluginId, pluginKey: plugin.pluginKey, err: errMessage },
+          "plugin lifecycle: reloadFromDisk reactivation failed; transitioning plugin to error",
+        );
+        try {
+          const errored = await transition(pluginId, "error", errMessage, {
+            ...plugin,
+            version: discovered.version,
+            manifestJson: newManifest,
+          } as PluginRecord);
+          emitDomain("plugin.error", {
+            pluginId,
+            pluginKey: errored.pluginKey,
+            error: errMessage,
+          });
+        } catch (transitionErr) {
+          log.error(
+            {
+              pluginId,
+              pluginKey: plugin.pluginKey,
+              err: transitionErr instanceof Error
+                ? transitionErr.message
+                : String(transitionErr),
+            },
+            "plugin lifecycle: failed to mark plugin as error after reloadFromDisk failure",
+          );
+        }
+        throw err;
+      }
     },
 
     // -- getStatus --------------------------------------------------------

@@ -277,7 +277,19 @@ export function createPluginDevWatcher(
             );
 
             const reloadPromise = needsManifestReload
-              ? lifecycle.reloadFromDisk(pluginId).then(() => undefined)
+              ? lifecycle.reloadFromDisk(pluginId).then(() => {
+                  // package.json may have moved the manifest pointer
+                  // (paperclipPlugin.manifest) or shifted other entrypoints.
+                  // Targets and manifestEntrypoint were resolved once at
+                  // watcher creation, and `watchPlugin` is guarded by
+                  // `watchers.has(pluginId)`, so the lifecycle's own
+                  // `plugin.loaded`/`plugin.enabled` events will not refresh
+                  // them. Recreate the watcher in-place so subsequent edits
+                  // to the new manifest path route via `reloadFromDisk`
+                  // instead of being missed or misclassified.
+                  unwatchPlugin(pluginId);
+                  watchPlugin(pluginId, absPath);
+                })
               : lifecycle.restartWorker(pluginId);
 
             reloadPromise.catch((err) => {
