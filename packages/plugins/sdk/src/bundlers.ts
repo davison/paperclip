@@ -86,14 +86,26 @@ export function createPluginBundlerPresets(input: PluginBundlerPresetInput = {})
     external: ["react", "react-dom"],
   };
 
+  // Bundle the manifest into a single self-contained `dist/manifest.js`.
+  //
+  // RED-187: with `bundle: false`, esbuild emits the manifest entry verbatim
+  // including its relative imports (e.g. `./tools/index.js`). But tsc emits
+  // those siblings to `dist/lib/tools/index.js`, not `dist/tools/index.js`,
+  // so the host loader fails to resolve the import at install / upgrade time
+  // (`Cannot find module .../dist/tools/index.js`).
+  //
+  // Bundling inlines the relative graph and keeps `@paperclipai/plugin-sdk`
+  // external (the host always provides the SDK runtime). This mirrors the
+  // rollup-side `rollupManifest` config below.
   const esbuildManifest: EsbuildLikeOptions = {
     entryPoints: [manifestEntry],
     outdir,
-    bundle: false,
+    bundle: true,
     format: "esm",
     platform: "node",
     target: "node20",
     sourcemap,
+    external: ["@paperclipai/plugin-sdk"],
   };
 
   const esbuildUi = uiEntry
