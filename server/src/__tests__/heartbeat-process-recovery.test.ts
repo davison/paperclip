@@ -68,6 +68,7 @@ vi.mock("../adapters/index.ts", async () => {
 });
 
 import { heartbeatService } from "../services/heartbeat.ts";
+import { recoveryService } from "../services/recovery/service.ts";
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
 
@@ -2132,15 +2133,12 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("posted no comment");
   });
 
-  it("does not escalate to blocked when an active run exists alongside the no-progress streak (RED-167 race gate)", async () => {
-    // Defense-in-depth test for the QA-VETO finding on RED-160. Even when the
-    // empty-response streak (3 silent succeeded runs) is satisfied, the
-    // escalation must NOT fire if a fresh continuation run is already active
-    // for the issue. The reconcile precondition (hasActiveExecutionPath) catches
-    // the obvious case; the locked compare-and-set inside
-    // escalateStrandedAssignedIssue catches the race where a new run appears
-    // between the precondition and the mutation. This test asserts the
-    // end-state property: an active run on the issue must keep it in_progress.
+  it("skips escalation at the reconcile precheck when an active run already exists alongside the no-progress streak (RED-167 precheck)", async () => {
+    // Path 1 of the race-gate property: the cheap reconcile precheck
+    // `hasActiveExecutionPath(...)` filters the issue out *before*
+    // `escalateStrandedAssignedIssue` runs at all. This test exists to lock
+    // that fast-path in place (regressing it would silently push every
+    // race-window onto the locked CAS gate alone).
     const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
       status: "in_progress",
       runStatus: "succeeded",
@@ -2167,7 +2165,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
 
     // A new continuation run is already queued for this issue — execution is
-    // live. Escalation must not block the issue while this run can resume.
+    // live before reconcile even starts. The precheck must filter the issue out.
     const liveRunId = randomUUID();
     const liveStartedAt = new Date(Date.UTC(2026, 2, 19, 1, 0));
     await db.insert(heartbeatRuns).values({
@@ -2194,6 +2192,75 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
 
     const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
     expect(issue?.status).toBe("in_progress");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    // Drain the queued live run so afterEach cleanup is not racing with it.
+    await waitForRunToSettle(heartbeat, liveRunId);
+  });
+
+  it("aborts escalation inside the locked CAS gate when an active run appears between precheck and mutation (RED-167 race gate)", async () => {
+    // Path 2 of the race-gate property — the genuine TOCTOU window the QA
+    // veto called out. The reconcile precheck is read-only, so a queued
+    // continuation run can land *after* the precheck decided to escalate but
+    // *before* `issuesSvc.update` flips the issue to `blocked`. We exercise
+    // the CAS gate directly: call `escalateStrandedAssignedIssue` with the
+    // active run already present in the database (simulating that landing),
+    // then assert the in-tx recheck refuses to flip status.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+    });
+
+    const issueRow = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    if (!issueRow) throw new Error("seedStrandedIssueFixture did not create the issue row");
+
+    // Concurrent continuation run, queued after the (imagined) precheck.
+    const liveRunId = randomUUID();
+    const liveStartedAt = new Date(Date.UTC(2026, 2, 19, 1, 0));
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: null,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      },
+      startedAt: liveStartedAt,
+      updatedAt: liveStartedAt,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const recovery = recoveryService(db, { enqueueWakeup: async () => null });
+
+    const escalated = await recovery.escalateStrandedAssignedIssue({
+      issue: issueRow,
+      previousStatus: "in_progress",
+      latestRun: null,
+      comment: "RED-167 CAS-gate regression — escalation should be aborted by the locked recheck.",
+    });
+
+    // The CAS gate must abort the mutation: returning null and leaving the
+    // issue untouched.
+    expect(escalated).toBeNull();
+
+    const issueAfter = await db
+      .select()
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issueAfter?.status).toBe("in_progress");
 
     const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
     expect(comments).toHaveLength(0);

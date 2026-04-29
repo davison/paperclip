@@ -370,9 +370,14 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     return count;
   }
 
-  async function hasActiveExecutionPath(companyId: string, issueId: string) {
+  async function hasActiveExecutionPath(
+    companyId: string,
+    issueId: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    dbOrTx: any = db,
+  ) {
     const [run, deferredWake] = await Promise.all([
-      db
+      dbOrTx
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
         .where(
@@ -383,8 +388,8 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ),
         )
         .limit(1)
-        .then((rows) => rows[0] ?? null),
-      db
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+      dbOrTx
         .select({ id: agentWakeupRequests.id })
         .from(agentWakeupRequests)
         .where(
@@ -395,7 +400,7 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
           ),
         )
         .limit(1)
-        .then((rows) => rows[0] ?? null),
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null),
     ]);
 
     return Boolean(run || deferredWake);
@@ -1568,9 +1573,41 @@ export function recoveryService(db: Db, deps: { enqueueWakeup: RecoveryWakeup })
     const nextBlockerIds = recoveryIssue
       ? [...new Set([...blockerIds, recoveryIssue.id])]
       : blockerIds;
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
-      blockedByIssueIds: nextBlockerIds,
+    // RED-167: gate the status flip on a locked compare-and-set so a continuation
+    // run that races in between the precheck (`hasActiveExecutionPath` at the top
+    // of `reconcileStrandedAssignedIssues`) and this mutation cannot be silently
+    // blocked. Lock the issue row, re-verify the issue is still in
+    // `previousStatus` with the same agent assignee and no human assignee, and
+    // re-check `hasActiveExecutionPath` against the same tx. Any concurrent state
+    // change aborts the escalation; the caller treats `null` as skipped and the
+    // next reconcile pass re-checks.
+    const updated = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issue.id} for update`,
+      );
+
+      const current = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.issue.id))
+        .then((rows) => rows[0] ?? null);
+      if (!current) return null;
+      if (current.status !== input.previousStatus) return null;
+      if (current.assigneeUserId) return null;
+      if (current.assigneeAgentId !== input.issue.assigneeAgentId) return null;
+
+      if (await hasActiveExecutionPath(input.issue.companyId, input.issue.id, tx)) {
+        return null;
+      }
+
+      return issuesSvc.update(
+        input.issue.id,
+        {
+          status: "blocked",
+          blockedByIssueIds: nextBlockerIds,
+        },
+        tx,
+      );
     });
     if (!updated) return null;
 
