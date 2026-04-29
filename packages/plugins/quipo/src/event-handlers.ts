@@ -577,6 +577,7 @@ export async function onMemoryWorkerComment(
         isParseableExtractionReply(c.body),
     );
     if (priorParseable) {
+      await clearParseErrorState(ctx, extractionIssue.id);
       await closeExtractionIssue(
         ctx,
         extractionIssue.id,
@@ -604,19 +605,27 @@ export async function onMemoryWorkerComment(
   // what produced the RED-162 self-loop. Only `parse_error` keeps the issue
   // open, and even then only until MAX_PARSE_ERROR_ATTEMPTS is reached.
   if (
-    (result.status === "harvested" ||
-      result.status === "empty" ||
-      result.status === "already_harvested") &&
-    extractionIssue.status !== "done"
+    result.status === "harvested" ||
+    result.status === "empty" ||
+    result.status === "already_harvested"
   ) {
-    await closeExtractionIssue(
-      ctx,
-      extractionIssue.id,
-      event.companyId,
-      memoryAgentId,
-      payload.runId ?? null,
-      `harvest result: ${result.status}`,
-    );
+    // RED-166: the parse-error counter measures *consecutive* parse failures
+    // (per the inline contract on MAX_PARSE_ERROR_ATTEMPTS). A successful
+    // parseable outcome breaks the streak, so clear any persisted counter
+    // before closing — otherwise a later parse_error on a *different*
+    // commentId would tip the issue into `blocked` even though parse
+    // failures were not consecutive.
+    await clearParseErrorState(ctx, extractionIssue.id);
+    if (extractionIssue.status !== "done") {
+      await closeExtractionIssue(
+        ctx,
+        extractionIssue.id,
+        event.companyId,
+        memoryAgentId,
+        payload.runId ?? null,
+        `harvest result: ${result.status}`,
+      );
+    }
     return;
   }
 
@@ -642,6 +651,25 @@ function isParseableExtractionReply(body: string): boolean {
     return true;
   } catch {
     return false;
+  }
+}
+
+/** Clear any persisted parse_error retry counter for an extraction issue.
+ *  Called on every successful parseable outcome (harvested / empty /
+ *  already_harvested) so the counter only ever reflects *consecutive* parse
+ *  failures, matching the MAX_PARSE_ERROR_ATTEMPTS contract (RED-166). */
+async function clearParseErrorState(
+  ctx: PluginContext,
+  extractionIssueId: string,
+): Promise<void> {
+  try {
+    await ctx.state.delete(parseErrorCountStateKey(extractionIssueId));
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    ctx.logger.warn("Quipo: failed to clear parse-error state", {
+      extractionIssueId,
+      detail,
+    });
   }
 }
 

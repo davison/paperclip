@@ -7,6 +7,7 @@ import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/tes
 import manifest from "../src/manifest.js";
 import {
   commentOriginId,
+  parseErrorCountStateKey,
   registerQuipoEventHandlers,
 } from "../src/event-handlers.js";
 
@@ -558,6 +559,47 @@ describe("Quipo memory-worker comment — extraction-issue closure (RED-162)", (
       /INSERT INTO .*\.facts/.test(e.sql),
     );
     expect(factInserts).toHaveLength(0);
+  });
+
+  it("resets the parse-error counter on a successful parseable outcome so non-consecutive parse errors do not trigger blocked (RED-166)", async () => {
+    // The MAX_PARSE_ERROR_ATTEMPTS contract counts *consecutive* parse
+    // failures. A successful parseable outcome (harvested / empty /
+    // already_harvested) must clear the persisted counter, otherwise a
+    // sequence like `parse_error -> harvested -> parse_error` reaches
+    // count=2 and wrongly marks the issue `blocked`.
+
+    // 1. First parse_error: counter -> 1, issue stays open.
+    const garbage1 = makeReplyComment({ body: "definitely not json" });
+    harness.seed({ issueComments: [garbage1] });
+    await emitWorkerReply(garbage1);
+
+    const counterAfterFirstParseError = (await harness.ctx.state.get(
+      parseErrorCountStateKey(extractionIssueId),
+    )) as { count?: number } | null;
+    expect(counterAfterFirstParseError?.count).toBe(1);
+
+    // 2. Successful parseable reply: harvest closes the issue. The counter
+    // must be cleared so the next parse_error starts a fresh streak. Re-open
+    // first to mirror the "heartbeat re-marked it in_progress" path that
+    // produced the original RED-162 loop and to keep the harvest path active.
+    await harness.ctx.issues.update(
+      extractionIssueId,
+      { status: "in_progress" },
+      COMPANY_ID,
+    );
+    const good = makeReplyComment({ body: JSON.stringify({ facts: [] }) });
+    harness.seed({ issueComments: [garbage1, good] });
+    await emitWorkerReply(good);
+
+    const issue = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(issue!.status).toBe("done");
+
+    // 3. The persisted parse-error counter must now be cleared. This is the
+    // direct contract: the streak resets on a successful parseable outcome.
+    const counterAfterSuccess = await harness.ctx.state.get(
+      parseErrorCountStateKey(extractionIssueId),
+    );
+    expect(counterAfterSuccess).toBeNull();
   });
 
   it("does not advance the parse-error retry counter when the same parse_error commentId is redelivered (RED-166 dedupe)", async () => {
