@@ -150,12 +150,17 @@ export interface PluginToolDispatcher {
    * This is called automatically when a plugin transitions to `ready`.
    * Can also be called manually for testing or recovery scenarios.
    *
-   * @param pluginId - The plugin's unique identifier
+   * @param pluginId - The plugin's namespace key (used in `pluginKey:tool` names)
    * @param manifest - The plugin manifest containing tool declarations
+   * @param pluginDbId - The plugin's database UUID, used for worker dispatch.
+   *   Required for `executeTool` to find the running worker — the worker
+   *   manager keys workers by UUID, not by plugin key (RED-132). Falls back
+   *   to `pluginId` only for the legacy in-memory test path.
    */
   registerPluginTools(
     pluginId: string,
     manifest: PaperclipPluginManifestV1,
+    pluginDbId?: string,
   ): void;
 
   /**
@@ -429,8 +434,9 @@ export function createPluginToolDispatcher(
     registerPluginTools(
       pluginId: string,
       manifest: PaperclipPluginManifestV1,
+      pluginDbId?: string,
     ): void {
-      registry.registerPlugin(pluginId, manifest);
+      registry.registerPlugin(pluginId, manifest, pluginDbId);
     },
 
     unregisterPluginTools(pluginId: string): void {
