@@ -26,12 +26,25 @@ Quipo is a normal Paperclip plugin — no special host build, no extra runtime. 
 
 The whole install is "install the plugin + create the memory-worker agent + flip the switch."
 
-1. **Install Quipo into your Paperclip instance.** From the plugins directory:
+> **Status: pre-publish (`0.1.0-rc.1`).** Quipo is not yet published to npm — the rc.1 tag is gated on [RED-129](https://github.com/paperclip-ai/paperclip/issues/RED-129) (a manifest-load fix for the published tarball). Until RED-129 ships, install Quipo from the monorepo workspace path described below. Once rc.1 is on npm, the registry install will be `pnpm add @paperclipai/plugin-quipo@rc` (always pin the `@rc` dist-tag while the package is in release-candidate state — `latest` will not resolve to the rc).
+
+1. **Install Quipo into your Paperclip instance.**
+
+   _While the package is pre-publish_ (current state — RED-129 open), use the monorepo workspace path. From the Paperclip checkout:
 
    ```bash
-   pnpm install @paperclipai/plugin-quipo
+   pnpm --filter @paperclipai/plugin-quipo install
    pnpm --filter @paperclipai/plugin-quipo build
    ```
+
+   _Once `0.1.0-rc.1` is published to npm_ (RED-129 merged), install from the registry with the `@rc` dist-tag:
+
+   ```bash
+   pnpm add @paperclipai/plugin-quipo@rc
+   pnpm --filter @paperclipai/plugin-quipo build
+   ```
+
+   Do not run `pnpm add @paperclipai/plugin-quipo` without `@rc` while the package is in release-candidate state — `latest` is reserved for the eventual `0.1.0` final and an unpinned install will either fail or silently resolve to a different version.
 
    Then register it with the host the same way you register any other plugin (the `paperclipPlugin` entry in `package.json` is the manifest pointer). On first load Quipo runs `migrations/001_init_memory.sql` against its private namespace `plugin_quipo_d14f4ce0c0` — the host needs `pg_trgm` enabled in core (Paperclip core migration `0051_young_korg.sql` already does this).
 
