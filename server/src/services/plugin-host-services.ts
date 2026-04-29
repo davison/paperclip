@@ -1033,12 +1033,20 @@ export function buildHostServices(
         await ensurePluginAvailableForCompany(companyId);
         const { actorAgentId, actorUserId, actorRunId, originKind, hiddenAt, ...issueInput } = params;
         const normalizedOriginKind = normalizePluginOriginKind(originKind);
-        const normalizedHiddenAt =
-          typeof hiddenAt === "string" && hiddenAt.length > 0
-            ? new Date(hiddenAt)
-            : hiddenAt === null
-              ? null
-              : undefined;
+        let normalizedHiddenAt: Date | null | undefined;
+        if (hiddenAt === null) {
+          normalizedHiddenAt = null;
+        } else if (typeof hiddenAt === "string" && hiddenAt.length > 0) {
+          const parsed = new Date(hiddenAt);
+          if (Number.isNaN(parsed.getTime())) {
+            throw new Error(
+              `Plugin issues.create: hiddenAt must be a valid ISO timestamp string (received ${JSON.stringify(hiddenAt)})`,
+            );
+          }
+          normalizedHiddenAt = parsed;
+        } else {
+          normalizedHiddenAt = undefined;
+        }
         const issue = (await issues.create(companyId, {
           ...(issueInput as any),
           ...(normalizedHiddenAt !== undefined ? { hiddenAt: normalizedHiddenAt } : {}),
