@@ -2011,6 +2011,19 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
   const recovery = recoveryService(db, { enqueueWakeup });
   let unsafeTextProjectionPromise: Promise<boolean> | null = null;
 
+  // Counters for wake suppression observability. RED-164.
+  // pausedSuppressionCounters tracks how many wake attempts each agent has had
+  // suppressed because it is in a non-invokable status (paused / terminated /
+  // pending_approval). Useful for spotting a stuck pause that the wake pipeline
+  // keeps re-trying (e.g. plugin self-loop into a paused worker).
+  const pausedSuppressionCounters = new Map<string, { count: number; lastAt: Date; lastSource: string; lastStatus: string }>();
+  // Tracks the last time we emitted an info-level log for a given agent so we
+  // do not spam the log when many wakes hit the same paused agent in quick
+  // succession. The first hit logs at info; subsequent hits within
+  // PAUSED_LOG_DEDUP_MS are silently counted only.
+  const pausedSuppressionLastLogAt = new Map<string, number>();
+  const PAUSED_LOG_DEDUP_MS = 60_000;
+
   async function hasUnsafeTextProjectionDatabase() {
     if (!unsafeTextProjectionPromise) {
       unsafeTextProjectionPromise = db
@@ -6463,6 +6476,68 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
 
     const agent = await getAgent(agentId);
     if (!agent) throw notFound("Agent not found");
+
+    // RED-164: defense-in-depth guard. If the agent is in a non-invokable
+    // status (paused, terminated, pending_approval) we MUST refuse to start a
+    // run regardless of which entry point asked for the wake (timer,
+    // assignment, plugin requestWakeup, comment mention). Pausing an agent has
+    // to hard-stop it cold so a buggy plugin or scheduler tick cannot keep
+    // restarting it. We record the suppression in agent_wakeup_requests, log
+    // the first occurrence per dedup window, and bump an in-process counter so
+    // a stuck pause is visible.
+    if (
+      agent.status === "paused" ||
+      agent.status === "terminated" ||
+      agent.status === "pending_approval"
+    ) {
+      const now = new Date();
+      const counter = pausedSuppressionCounters.get(agentId) ?? {
+        count: 0,
+        lastAt: now,
+        lastSource: source,
+        lastStatus: agent.status,
+      };
+      counter.count += 1;
+      counter.lastAt = now;
+      counter.lastSource = source;
+      counter.lastStatus = agent.status;
+      pausedSuppressionCounters.set(agentId, counter);
+
+      const lastLogged = pausedSuppressionLastLogAt.get(agentId) ?? 0;
+      if (now.getTime() - lastLogged >= PAUSED_LOG_DEDUP_MS) {
+        pausedSuppressionLastLogAt.set(agentId, now.getTime());
+        logger.info(
+          {
+            agentId,
+            agentName: agent.name,
+            status: agent.status,
+            source,
+            triggerDetail,
+            reason,
+            issueId: issueId ?? null,
+            suppressionCount: counter.count,
+          },
+          "wake suppressed: agent is not invokable",
+        );
+      }
+
+      await db.insert(agentWakeupRequests).values({
+        companyId: agent.companyId,
+        agentId,
+        source,
+        triggerDetail,
+        reason: "agent_paused",
+        payload,
+        status: "skipped",
+        requestedByActorType: opts.requestedByActorType ?? null,
+        requestedByActorId: opts.requestedByActorId ?? null,
+        idempotencyKey: opts.idempotencyKey ?? null,
+        finishedAt: now,
+      });
+
+      return null;
+    }
+
     const explicitResumeSession = await resolveExplicitResumeSessionOverride(agent, payload, taskKey);
     if (explicitResumeSession) {
       enrichedContextSnapshot.resumeFromRunId = explicitResumeSession.resumeFromRunId;
@@ -6520,14 +6595,6 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
         scopeType: budgetBlock.scopeType,
         scopeId: budgetBlock.scopeId,
       });
-    }
-
-    if (
-      agent.status === "paused" ||
-      agent.status === "terminated" ||
-      agent.status === "pending_approval"
-    ) {
-      throw conflict("Agent is not invokable in its current state", { status: agent.status });
     }
 
     const policy = parseHeartbeatPolicy(agent);
@@ -7585,6 +7652,27 @@ export function heartbeatService(db: Db, options: HeartbeatServiceOptions = {}) 
       }),
 
     wakeup: enqueueWakeup,
+
+    /** Snapshot of paused-agent wake suppressions since process start. RED-164. */
+    getPausedSuppressionMetrics: () => {
+      const out: Array<{
+        agentId: string;
+        count: number;
+        lastAt: string;
+        lastSource: string;
+        lastStatus: string;
+      }> = [];
+      for (const [agentId, entry] of pausedSuppressionCounters.entries()) {
+        out.push({
+          agentId,
+          count: entry.count,
+          lastAt: entry.lastAt.toISOString(),
+          lastSource: entry.lastSource,
+          lastStatus: entry.lastStatus,
+        });
+      }
+      return out;
+    },
 
     reportRunActivity: clearDetachedRunWarning,
 
