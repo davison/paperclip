@@ -86,6 +86,16 @@ export interface HarvestResult {
  *
  *  Returns a status describing what happened so the caller can log accurately
  *  and decide whether to flip the extraction issue to `done`/`blocked`.
+ *
+ *  Failure-safety contract (RED-169): on a happy path the call writes a
+ *  pre-claim `in_progress` state record before any DB write, then the facts
+ *  table is mutated by a single multi-row `INSERT` (atomic at the Postgres
+ *  statement level), then state is finalized to `harvested`, and only then are
+ *  the sessions / peer_models rollups applied. Re-entry on any prior outcome
+ *  short-circuits, so a partial-failure retry CANNOT duplicate facts. The
+ *  trade-off is rare data loss on transient DB failures rather than data
+ *  corruption — rollups, in particular, are best-effort: a failure there
+ *  leaves the rollup slightly low but never re-inserts facts.
  */
 export async function harvestExtraction(
   ctx: PluginContext,
@@ -96,7 +106,10 @@ export async function harvestExtraction(
   const stateKey = harvestStateKey(commentId);
   const existing = await ctx.state.get(stateKey);
   if (existing) {
-    ctx.logger.debug("Quipo: harvest already recorded for comment", { commentId });
+    ctx.logger.debug("Quipo: harvest already recorded for comment", {
+      commentId,
+      outcome: (existing as { outcome?: string }).outcome,
+    });
     return { status: "already_harvested", factsInserted: 0, totalFactsInResponse: 0 };
   }
 
@@ -133,8 +146,22 @@ export async function harvestExtraction(
   }
 
   const ns = ctx.db.namespace;
-  let insertedCount = 0;
+  const insertedCount = parsed.facts.length;
 
+  // Pre-claim before any DB write so a retry triggered after a partial failure
+  // observes a non-empty state and short-circuits, rather than re-running the
+  // INSERT and duplicating facts. Treats unfinished work as terminal — we
+  // prefer rare data loss to silent data duplication.
+  await ctx.state.set(stateKey, {
+    outcome: "in_progress",
+    at: new Date().toISOString(),
+  });
+
+  // Single multi-row INSERT — Postgres treats one statement as atomic, so
+  // facts are either all written or none, eliminating mid-loop partial state.
+  const placeholders: string[] = [];
+  const params: unknown[] = [];
+  let pi = 1;
   for (const fact of parsed.facts) {
     const factAgentId = factAgentForRow(fact, link);
     const sourceIds = collectUuidSourceIds(link, extractionIssueId);
@@ -146,24 +173,38 @@ export async function harvestExtraction(
       extraction_issue_id: extractionIssueId,
       extraction_run_id: input.extractionRunId ?? null,
     };
-
-    await ctx.db.execute(
-      `INSERT INTO ${ns}.facts (company_id, issue_id, agent_id, content, level, source_ids, metadata)
-       VALUES ($1, $2, $3, $4, $5, $6::uuid[], $7::jsonb)`,
-      [
-        companyId,
-        link.sourceIssueId,
-        factAgentId,
-        fact.content,
-        levelForConfidence(fact.confidence),
-        sourceIds,
-        JSON.stringify(metadata),
-      ],
+    placeholders.push(
+      `($${pi++}, $${pi++}, $${pi++}, $${pi++}, $${pi++}, $${pi++}::uuid[], $${pi++}::jsonb)`,
     );
-    insertedCount += 1;
+    params.push(
+      companyId,
+      link.sourceIssueId,
+      factAgentId,
+      fact.content,
+      levelForConfidence(fact.confidence),
+      sourceIds,
+      JSON.stringify(metadata),
+    );
   }
+  await ctx.db.execute(
+    `INSERT INTO ${ns}.facts (company_id, issue_id, agent_id, content, level, source_ids, metadata)
+     VALUES ${placeholders.join(", ")}`,
+    params,
+  );
 
-  // Sessions: upsert per source issue, summing fact_count.
+  // Finalize the idempotency marker BEFORE the rollups so any rollup failure
+  // cannot trigger a retry that re-inserts the facts.
+  await ctx.state.set(stateKey, {
+    outcome: "harvested",
+    factsInserted: insertedCount,
+    totalFactsInResponse: parsed.facts.length,
+    extractionIssueId,
+    extractionRunId: input.extractionRunId ?? null,
+    at: new Date().toISOString(),
+  });
+
+  // Best-effort rollups. State is already `harvested`, so a failure here
+  // leaves the rollups slightly low rather than re-running the INSERT.
   await ctx.db.execute(
     `INSERT INTO ${ns}.sessions (company_id, issue_id, fact_count)
      VALUES ($1, $2, $3)
@@ -173,7 +214,6 @@ export async function harvestExtraction(
     [companyId, link.sourceIssueId, insertedCount],
   );
 
-  // Peer models: only roll up agent-targeted facts when we know which peer.
   if (link.peerAgentId) {
     const agentFactCount = parsed.facts.filter(
       (f) => f.about_peer === "agent",
@@ -189,15 +229,6 @@ export async function harvestExtraction(
       );
     }
   }
-
-  await ctx.state.set(stateKey, {
-    outcome: "harvested",
-    factsInserted: insertedCount,
-    totalFactsInResponse: parsed.facts.length,
-    extractionIssueId,
-    extractionRunId: input.extractionRunId ?? null,
-    at: new Date().toISOString(),
-  });
 
   ctx.logger.info("Quipo: harvested extraction", {
     commentId,
