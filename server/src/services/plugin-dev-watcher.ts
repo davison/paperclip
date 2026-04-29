@@ -205,6 +205,200 @@ export function createPluginDevWatcher(
   const pendingChangedPaths = new Map<string, Set<string>>();
   const fileExists = fsDeps?.existsSync ?? existsSync;
 
+  /** Per-plugin: remember the absolute package path so we can re-resolve targets later. */
+  const packagePaths = new Map<string, string>();
+  /** Per-plugin: remember the resolved package.json absolute path so we can detect package.json edits. */
+  const packageJsonPaths = new Map<string, string>();
+
+  function startWatcher(pluginId: string, absPath: string): boolean {
+    const watcherTargets = resolvePluginWatchTargets(absPath, fsDeps);
+    if (watcherTargets.length === 0) {
+      log.warn(
+        { pluginId, packagePath: absPath },
+        "plugin-dev-watcher: no valid watch targets found, skipping watch",
+      );
+      return false;
+    }
+
+    const manifestEntry = resolvePluginManifestEntry(absPath, fsDeps);
+    if (manifestEntry) {
+      manifestPaths.set(pluginId, manifestEntry);
+    } else {
+      manifestPaths.delete(pluginId);
+    }
+    packageJsonPaths.set(pluginId, path.resolve(path.join(absPath, "package.json")));
+
+    const watcher = chokidar.watch(
+      watcherTargets.map((target) => target.path),
+      {
+        ignoreInitial: true,
+        awaitWriteFinish: {
+          stabilityThreshold: 200,
+          pollInterval: 100,
+        },
+        ignored: (watchedPath) => {
+          const relativePath = path.relative(absPath, watchedPath);
+          return shouldIgnorePath(relativePath);
+        },
+      },
+    );
+
+    watcher.on("all", (_eventName, changedPath) => {
+      const relativePath = path.relative(absPath, changedPath);
+      if (shouldIgnorePath(relativePath)) return;
+
+      const resolvedChangedPath = path.resolve(changedPath);
+      let pending = pendingChangedPaths.get(pluginId);
+      if (!pending) {
+        pending = new Set<string>();
+        pendingChangedPaths.set(pluginId, pending);
+      }
+      pending.add(resolvedChangedPath);
+
+      const existing = debounceTimers.get(pluginId);
+      if (existing) clearTimeout(existing);
+
+      debounceTimers.set(
+        pluginId,
+        setTimeout(() => {
+          debounceTimers.delete(pluginId);
+          const changedPaths = pendingChangedPaths.get(pluginId) ?? new Set<string>();
+          pendingChangedPaths.delete(pluginId);
+          const changedFile = relativePath || path.basename(changedPath);
+
+          // If package.json itself changed, the manifest pointer (or worker/ui pointers) may have moved.
+          // Re-resolve the manifest entry and watch-targets, and if anything changed, rebuild the
+          // watcher so subsequent edits to the new manifest path are observed.
+          const packageJsonPath = packageJsonPaths.get(pluginId);
+          const packageJsonChanged = packageJsonPath
+            ? changedPaths.has(packageJsonPath)
+            : false;
+
+          let manifestPointerChanged = false;
+          if (packageJsonChanged) {
+            const previousManifestEntry = manifestPaths.get(pluginId) ?? null;
+            const newManifestEntry = resolvePluginManifestEntry(absPath, fsDeps);
+
+            const previousTargets = new Set(
+              resolvePluginWatchTargetsFromCache(pluginId),
+            );
+            const newTargetsList = resolvePluginWatchTargets(absPath, fsDeps);
+            const newTargets = new Set(newTargetsList.map((t) => t.path));
+            const targetsDiffer =
+              previousTargets.size !== newTargets.size ||
+              ![...newTargets].every((p) => previousTargets.has(p));
+
+            if (newManifestEntry !== previousManifestEntry || targetsDiffer) {
+              manifestPointerChanged = true;
+              log.info(
+                {
+                  pluginId,
+                  previousManifestEntry,
+                  newManifestEntry,
+                  targetsDiffer,
+                },
+                "plugin-dev-watcher: package.json changed manifest/watch targets, rebuilding watcher",
+              );
+              cachedTargets.set(pluginId, [...newTargets]);
+              if (newManifestEntry) {
+                manifestPaths.set(pluginId, newManifestEntry);
+              } else {
+                manifestPaths.delete(pluginId);
+              }
+              const existingWatcher = watchers.get(pluginId);
+              if (existingWatcher) {
+                void existingWatcher.close();
+                watchers.delete(pluginId);
+              }
+              const restarted = startWatcher(pluginId, absPath);
+              if (!restarted) {
+                log.warn(
+                  { pluginId, packagePath: absPath },
+                  "plugin-dev-watcher: rebuild yielded no targets; plugin no longer watched",
+                );
+              }
+            }
+          }
+
+          const manifestPath = manifestPaths.get(pluginId);
+          const manifestChanged =
+            manifestPointerChanged ||
+            (manifestPath ? changedPaths.has(manifestPath) : false);
+
+          if (manifestChanged) {
+            log.info(
+              { pluginId, changedFile, manifestPath, manifestPointerChanged },
+              "plugin-dev-watcher: manifest change detected, reactivating plugin",
+            );
+            reactivatePlugin(pluginId).catch((err) => {
+              log.error(
+                {
+                  pluginId,
+                  err: err instanceof Error ? err.message : String(err),
+                  recoveryAction: "manual_enable_required",
+                },
+                "plugin-dev-watcher: reactivation failed; plugin may be left disabled — operator action required",
+              );
+            });
+            return;
+          }
+
+          log.info(
+            { pluginId, changedFile },
+            "plugin-dev-watcher: file change detected, restarting worker",
+          );
+
+          lifecycle.restartWorker(pluginId).catch((err) => {
+            log.warn(
+              {
+                pluginId,
+                err: err instanceof Error ? err.message : String(err),
+              },
+              "plugin-dev-watcher: failed to restart worker after file change",
+            );
+          });
+        }, DEBOUNCE_MS),
+      );
+    });
+
+    watcher.on("error", (err) => {
+      log.warn(
+        {
+          pluginId,
+          packagePath: absPath,
+          err: err instanceof Error ? err.message : String(err),
+        },
+        "plugin-dev-watcher: watcher error, stopping watch for this plugin",
+      );
+      unwatchPlugin(pluginId);
+    });
+
+    watchers.set(pluginId, watcher);
+    cachedTargets.set(
+      pluginId,
+      watcherTargets.map((target) => target.path),
+    );
+    log.info(
+      {
+        pluginId,
+        packagePath: absPath,
+        watchTargets: watcherTargets.map((target) => ({
+          path: target.path,
+          kind: target.kind,
+        })),
+      },
+      "plugin-dev-watcher: watching local plugin for changes",
+    );
+    return true;
+  }
+
+  /** Cache of last-resolved watch target paths per plugin (for diff on package.json change). */
+  const cachedTargets = new Map<string, string[]>();
+
+  function resolvePluginWatchTargetsFromCache(pluginId: string): string[] {
+    return cachedTargets.get(pluginId) ?? [];
+  }
+
   function watchPlugin(pluginId: string, packagePath: string): void {
     // Don't double-watch
     if (watchers.has(pluginId)) return;
@@ -218,121 +412,10 @@ export function createPluginDevWatcher(
       return;
     }
 
+    packagePaths.set(pluginId, absPath);
+
     try {
-      const watcherTargets = resolvePluginWatchTargets(absPath, fsDeps);
-      if (watcherTargets.length === 0) {
-        log.warn(
-          { pluginId, packagePath: absPath },
-          "plugin-dev-watcher: no valid watch targets found, skipping watch",
-        );
-        return;
-      }
-
-      const manifestEntry = resolvePluginManifestEntry(absPath, fsDeps);
-      if (manifestEntry) {
-        manifestPaths.set(pluginId, manifestEntry);
-      }
-
-      const watcher = chokidar.watch(
-        watcherTargets.map((target) => target.path),
-        {
-          ignoreInitial: true,
-          awaitWriteFinish: {
-            stabilityThreshold: 200,
-            pollInterval: 100,
-          },
-          ignored: (watchedPath) => {
-            const relativePath = path.relative(absPath, watchedPath);
-            return shouldIgnorePath(relativePath);
-          },
-        },
-      );
-
-      watcher.on("all", (_eventName, changedPath) => {
-        const relativePath = path.relative(absPath, changedPath);
-        if (shouldIgnorePath(relativePath)) return;
-
-        const resolvedChangedPath = path.resolve(changedPath);
-        let pending = pendingChangedPaths.get(pluginId);
-        if (!pending) {
-          pending = new Set<string>();
-          pendingChangedPaths.set(pluginId, pending);
-        }
-        pending.add(resolvedChangedPath);
-
-        const existing = debounceTimers.get(pluginId);
-        if (existing) clearTimeout(existing);
-
-        debounceTimers.set(
-          pluginId,
-          setTimeout(() => {
-            debounceTimers.delete(pluginId);
-            const changedPaths = pendingChangedPaths.get(pluginId) ?? new Set<string>();
-            pendingChangedPaths.delete(pluginId);
-
-            const manifestPath = manifestPaths.get(pluginId);
-            const manifestChanged = manifestPath ? changedPaths.has(manifestPath) : false;
-            const changedFile = relativePath || path.basename(changedPath);
-
-            if (manifestChanged) {
-              log.info(
-                { pluginId, changedFile, manifestPath },
-                "plugin-dev-watcher: manifest change detected, reactivating plugin",
-              );
-              reactivatePlugin(pluginId).catch((err) => {
-                log.warn(
-                  {
-                    pluginId,
-                    err: err instanceof Error ? err.message : String(err),
-                  },
-                  "plugin-dev-watcher: failed to reactivate plugin after manifest change",
-                );
-              });
-              return;
-            }
-
-            log.info(
-              { pluginId, changedFile },
-              "plugin-dev-watcher: file change detected, restarting worker",
-            );
-
-            lifecycle.restartWorker(pluginId).catch((err) => {
-              log.warn(
-                {
-                  pluginId,
-                  err: err instanceof Error ? err.message : String(err),
-                },
-                "plugin-dev-watcher: failed to restart worker after file change",
-              );
-            });
-          }, DEBOUNCE_MS),
-        );
-      });
-
-      watcher.on("error", (err) => {
-        log.warn(
-          {
-            pluginId,
-            packagePath: absPath,
-            err: err instanceof Error ? err.message : String(err),
-          },
-          "plugin-dev-watcher: watcher error, stopping watch for this plugin",
-        );
-        unwatchPlugin(pluginId);
-      });
-
-      watchers.set(pluginId, watcher);
-      log.info(
-        {
-          pluginId,
-          packagePath: absPath,
-          watchTargets: watcherTargets.map((target) => ({
-            path: target.path,
-            kind: target.kind,
-          })),
-        },
-        "plugin-dev-watcher: watching local plugin for changes",
-      );
+      startWatcher(pluginId, absPath);
     } catch (err) {
       log.warn(
         {
@@ -358,6 +441,9 @@ export function createPluginDevWatcher(
     }
     manifestPaths.delete(pluginId);
     pendingChangedPaths.delete(pluginId);
+    packageJsonPaths.delete(pluginId);
+    packagePaths.delete(pluginId);
+    cachedTargets.delete(pluginId);
   }
 
   /**
@@ -376,15 +462,36 @@ export function createPluginDevWatcher(
    * mismatch when it happens.
    */
   async function reactivatePlugin(pluginId: string): Promise<void> {
+    let disableSucceeded = false;
     try {
       await lifecycle.disable(pluginId, "dev-watcher: manifest reload");
+      disableSucceeded = true;
     } catch (err) {
       log.warn(
         { pluginId, err: err instanceof Error ? err.message : String(err) },
         "plugin-dev-watcher: disable step of manifest reload failed; attempting enable anyway",
       );
     }
-    await lifecycle.enable(pluginId);
+
+    try {
+      await lifecycle.enable(pluginId);
+    } catch (err) {
+      // If enable fails after a successful disable, the plugin is left in a
+      // disabled state with no live runtime. Surface this loudly so an operator
+      // can intervene rather than letting it become a silent outage. Emitting
+      // an explicit error log (not just a warn) keeps it visible in dashboards
+      // and on-disk error tracking.
+      log.error(
+        {
+          pluginId,
+          err: err instanceof Error ? err.message : String(err),
+          disableSucceeded,
+          recoveryAction: "manual_enable_required",
+        },
+        "plugin-dev-watcher: enable step of manifest reload failed; plugin left disabled",
+      );
+      throw err;
+    }
   }
 
   function close(): void {

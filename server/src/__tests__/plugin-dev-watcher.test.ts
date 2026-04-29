@@ -111,4 +111,69 @@ describe("resolvePluginWatchTargets", () => {
       { path: path.join(pluginDir, "dist", "nested", "chunk.js"), recursive: false, kind: "file" },
     ]);
   });
+
+  it("re-resolves the manifest entry when package.json points it elsewhere", () => {
+    const pluginDir = makeTempPluginDir();
+    mkdirSync(path.join(pluginDir, "dist"), { recursive: true });
+    writeFileSync(path.join(pluginDir, "dist", "manifest.js"), "export default {};\n");
+    writeFileSync(path.join(pluginDir, "dist", "manifest-v2.js"), "export default {};\n");
+    writeFileSync(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({
+        name: "@acme/example",
+        paperclipPlugin: { manifest: "./dist/manifest.js" },
+      }),
+    );
+
+    expect(resolvePluginManifestEntry(pluginDir)).toBe(
+      path.join(pluginDir, "dist", "manifest.js"),
+    );
+
+    // Author edits package.json to point manifest at a different file. The dev-watcher
+    // relies on this resolver returning the new path so it can rebuild watch targets
+    // and refresh the cached manifest pointer rather than continuing to track a stale
+    // entrypoint.
+    writeFileSync(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({
+        name: "@acme/example",
+        paperclipPlugin: { manifest: "./dist/manifest-v2.js" },
+      }),
+    );
+
+    expect(resolvePluginManifestEntry(pluginDir)).toBe(
+      path.join(pluginDir, "dist", "manifest-v2.js"),
+    );
+  });
+
+  it("re-resolves watch targets when package.json points entrypoints elsewhere", () => {
+    const pluginDir = makeTempPluginDir();
+    mkdirSync(path.join(pluginDir, "dist"), { recursive: true });
+    writeFileSync(path.join(pluginDir, "dist", "manifest.js"), "export default {};\n");
+    writeFileSync(path.join(pluginDir, "dist", "worker.js"), "export default {};\n");
+    writeFileSync(path.join(pluginDir, "dist", "worker-v2.js"), "export default {};\n");
+    writeFileSync(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({
+        name: "@acme/example",
+        paperclipPlugin: { manifest: "./dist/manifest.js", worker: "./dist/worker.js" },
+      }),
+    );
+
+    const initialTargets = resolvePluginWatchTargets(pluginDir).map((t) => t.path);
+    expect(initialTargets).toContain(path.join(pluginDir, "dist", "worker.js"));
+    expect(initialTargets).not.toContain(path.join(pluginDir, "dist", "worker-v2.js"));
+
+    writeFileSync(
+      path.join(pluginDir, "package.json"),
+      JSON.stringify({
+        name: "@acme/example",
+        paperclipPlugin: { manifest: "./dist/manifest.js", worker: "./dist/worker-v2.js" },
+      }),
+    );
+
+    const updatedTargets = resolvePluginWatchTargets(pluginDir).map((t) => t.path);
+    expect(updatedTargets).toContain(path.join(pluginDir, "dist", "worker-v2.js"));
+    expect(updatedTargets).not.toContain(path.join(pluginDir, "dist", "worker.js"));
+  });
 });
