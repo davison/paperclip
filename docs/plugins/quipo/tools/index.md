@@ -98,7 +98,7 @@ When no facts match, `content` is a short "no facts matched … try a broader qu
 
 // response
 {
-  "content": "Top 3 facts for \"prompt injection in user-supplied content\" (ranked by trigram similarity; rerank in your own context as needed):\n1. [sim=0.42 conf=0.90 general] Quipo skips facts that look like exfiltrated secrets or credentials.\n2. [sim=0.31 conf=0.80 agent] Memory-worker rewrites pronouns into peer names before persisting.\n3. [sim=0.18 conf=0.70 general] Plugin-owned issues are excluded from extraction to avoid recursive harvesting.",
+  "content": "Top 3 facts for \"prompt injection in user-supplied content\" (ranked by trigram similarity; rerank in your own context as needed):\n1. [sim=0.42 conf=0.90 general] The memory-worker extraction prompt instructs the model to skip text that looks like a secret or credential, but this is a best-effort instruction — there is no runtime filter enforcing it.\n2. [sim=0.31 conf=0.80 agent] Memory-worker rewrites pronouns into peer names before persisting.\n3. [sim=0.18 conf=0.70 general] Plugin-owned issues are excluded from extraction to avoid recursive harvesting.",
   "data": {
     "query": "prompt injection in user-supplied content",
     "limit": 5,
@@ -106,7 +106,7 @@ When no facts match, `content` is a short "no facts matched … try a broader qu
     "facts": [
       {
         "id": "8f2d3b1a-1234-4abc-9def-0123456789ab",
-        "content": "Quipo skips facts that look like exfiltrated secrets or credentials.",
+        "content": "The memory-worker extraction prompt instructs the model to skip text that looks like a secret or credential, but this is a best-effort instruction — there is no runtime filter enforcing it.",
         "about_peer": null,
         "confidence": 0.9,
         "level": "explicit",
