@@ -6,10 +6,17 @@ import {
   extractionLinkStateKey,
   harvestExtraction,
 } from "./harvest.js";
+import { parseExtractedFactsResponse } from "./prompts/extract-facts.js";
 
 const STATE_NAMESPACE = "extractions";
+const PARSE_ERROR_NAMESPACE = "parse-errors";
 const QUIPO_ORIGIN_KIND = `plugin:${QUIPO_PLUGIN_ID}` as const;
 const QUIPO_ORIGIN_PREFIX = QUIPO_ORIGIN_KIND;
+/** Max consecutive parse_error replies on the same extraction issue before
+ *  Quipo gives up and marks the extraction `blocked` for human triage.
+ *  Two strikes is enough to distinguish a transient model glitch from a
+ *  prompt the worker reliably cannot satisfy (RED-162). */
+const MAX_PARSE_ERROR_ATTEMPTS = 2;
 
 const FACT_BEARING_PATCH_KEYS: ReadonlySet<string> = new Set(["title", "description"]);
 
@@ -52,6 +59,14 @@ export function extractionIdempotencyStateKey(originId: string): ScopeKey {
 }
 
 const idempotencyStateKey = extractionIdempotencyStateKey;
+
+export function parseErrorCountStateKey(extractionIssueId: string): ScopeKey {
+  return {
+    scopeKind: "instance",
+    namespace: PARSE_ERROR_NAMESPACE,
+    stateKey: extractionIssueId,
+  };
+}
 
 export function isQuipoOriginatedIssue(originKind: unknown): boolean {
   if (typeof originKind !== "string") return false;
@@ -549,6 +564,31 @@ export async function onMemoryWorkerComment(
     return;
   }
 
+  // Loop breaker (RED-162): if a *prior* memory-worker comment on this
+  // extraction issue already contains parseable JSON, the harvest must have
+  // already run (or will be a no-op via the per-comment idempotency key).
+  // Force-close immediately so the heartbeat scheduler stops re-waking the
+  // worker every ~30s, and skip re-running harvestExtraction.
+  if (extractionIssue.status !== "done") {
+    const priorParseable = comments.some(
+      (c) =>
+        c.id !== commentId &&
+        c.authorAgentId === memoryAgentId &&
+        isParseableExtractionReply(c.body),
+    );
+    if (priorParseable) {
+      await closeExtractionIssue(
+        ctx,
+        extractionIssue.id,
+        event.companyId,
+        memoryAgentId,
+        payload.runId ?? null,
+        "prior parseable memory-worker reply already on issue",
+      );
+      return;
+    }
+  }
+
   const result = await harvestExtraction(ctx, {
     companyId: event.companyId,
     commentBody: fullBody,
@@ -558,27 +598,163 @@ export async function onMemoryWorkerComment(
     extractionRunId: payload.runId ?? null,
   });
 
-  // Close the extraction issue when the harvest completed (including empty
-  // results — an empty {facts:[]} response is valid). Leave it open on
-  // parse_error so a human or follow-up retry can investigate.
+  // Close the extraction issue on any outcome that produced parseable JSON,
+  // including `already_harvested` (a redelivery of the same comment that the
+  // first run already persisted). Leaving the issue open on a redelivery is
+  // what produced the RED-162 self-loop. Only `parse_error` keeps the issue
+  // open, and even then only until MAX_PARSE_ERROR_ATTEMPTS is reached.
   if (
-    (result.status === "harvested" || result.status === "empty") &&
+    (result.status === "harvested" ||
+      result.status === "empty" ||
+      result.status === "already_harvested") &&
     extractionIssue.status !== "done"
   ) {
-    try {
-      await ctx.issues.update(
-        extractionIssue.id,
-        { status: "done" },
-        event.companyId,
-        { actorAgentId: memoryAgentId, actorRunId: payload.runId ?? null },
-      );
-    } catch (err) {
-      const detail = err instanceof Error ? err.message : String(err);
-      ctx.logger.debug("Quipo: could not close extraction issue (non-fatal)", {
-        extractionIssueId: extractionIssue.id,
-        detail,
-      });
-    }
+    await closeExtractionIssue(
+      ctx,
+      extractionIssue.id,
+      event.companyId,
+      memoryAgentId,
+      payload.runId ?? null,
+      `harvest result: ${result.status}`,
+    );
+    return;
+  }
+
+  if (result.status === "parse_error") {
+    await handleParseError(ctx, {
+      extractionIssue,
+      companyId: event.companyId,
+      memoryAgentId,
+      runId: payload.runId ?? null,
+      commentId,
+      detail: result.parseError ?? "(no detail)",
+    });
+  }
+}
+
+/** True when `body` parses as a valid `{ facts: [...] }` envelope. Used by
+ *  the loop-breaker fast path so a `parse_error` reply does not count as
+ *  "we already harvested". */
+function isParseableExtractionReply(body: string): boolean {
+  if (!body) return false;
+  try {
+    parseExtractedFactsResponse(body);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Force-close the extraction issue and surface any close failure loudly so
+ *  the loop can be diagnosed from run logs. RED-162 originally swallowed close
+ *  failures at `debug`, hiding the cause of the self-loop. */
+async function closeExtractionIssue(
+  ctx: PluginContext,
+  extractionIssueId: string,
+  companyId: string,
+  memoryAgentId: string,
+  runId: string | null,
+  reason: string,
+): Promise<void> {
+  try {
+    await ctx.issues.update(
+      extractionIssueId,
+      { status: "done" },
+      companyId,
+      { actorAgentId: memoryAgentId, actorRunId: runId },
+    );
+  } catch (err) {
+    const detail = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    ctx.logger.warn("Quipo: failed to close extraction issue", {
+      extractionIssueId,
+      reason,
+      detail,
+      stack,
+    });
+  }
+}
+
+interface HandleParseErrorInput {
+  extractionIssue: Issue;
+  companyId: string;
+  memoryAgentId: string;
+  runId: string | null;
+  commentId: string;
+  detail: string;
+}
+
+/** Track parse_error attempts per extraction issue. Once the streak reaches
+ *  MAX_PARSE_ERROR_ATTEMPTS, mark the issue `blocked` with a comment naming
+ *  the failure so a human or follow-up tooling can intervene instead of the
+ *  worker re-trying every heartbeat (RED-162). */
+async function handleParseError(
+  ctx: PluginContext,
+  input: HandleParseErrorInput,
+): Promise<void> {
+  const { extractionIssue, companyId, memoryAgentId, runId, commentId, detail } = input;
+  const stateKey = parseErrorCountStateKey(extractionIssue.id);
+  const prior = (await ctx.state.get(stateKey)) as
+    | { count?: number }
+    | null
+    | undefined;
+  const nextCount = (prior?.count ?? 0) + 1;
+  await ctx.state.set(stateKey, { count: nextCount, lastDetail: detail, at: new Date().toISOString() });
+
+  if (nextCount < MAX_PARSE_ERROR_ATTEMPTS) {
+    ctx.logger.warn("Quipo: extraction parse_error — keeping issue open for retry", {
+      extractionIssueId: extractionIssue.id,
+      attempts: nextCount,
+      maxAttempts: MAX_PARSE_ERROR_ATTEMPTS,
+      detail,
+    });
+    return;
+  }
+
+  if (extractionIssue.status === "blocked" || extractionIssue.status === "done") {
+    return;
+  }
+
+  const reasonBody = [
+    "**Quipo: extraction blocked after repeated parse failures.**",
+    "",
+    `The memory-worker reply on \`${commentId}\` could not be parsed as a \`{facts:[...]}\` JSON envelope.`,
+    `Attempts: ${nextCount} (max ${MAX_PARSE_ERROR_ATTEMPTS}).`,
+    "",
+    "Last parse error:",
+    "",
+    "```",
+    detail,
+    "```",
+  ].join("\n");
+
+  try {
+    await ctx.issues.createComment(extractionIssue.id, reasonBody, companyId, {
+      authorAgentId: memoryAgentId,
+    });
+  } catch (err) {
+    const commentDetail = err instanceof Error ? err.message : String(err);
+    ctx.logger.warn("Quipo: failed to post parse-error reason comment", {
+      extractionIssueId: extractionIssue.id,
+      detail: commentDetail,
+    });
+  }
+
+  try {
+    await ctx.issues.update(
+      extractionIssue.id,
+      { status: "blocked" },
+      companyId,
+      { actorAgentId: memoryAgentId, actorRunId: runId },
+    );
+  } catch (err) {
+    const updateDetail = err instanceof Error ? err.message : String(err);
+    const stack = err instanceof Error ? err.stack : undefined;
+    ctx.logger.warn("Quipo: failed to mark extraction issue blocked", {
+      extractionIssueId: extractionIssue.id,
+      detail: updateDetail,
+      stack,
+    });
   }
 }
 

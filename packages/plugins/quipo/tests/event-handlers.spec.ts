@@ -1,11 +1,14 @@
 import { randomUUID } from "node:crypto";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import type { Issue } from "@paperclipai/shared";
+import type { Issue, IssueComment } from "@paperclipai/shared";
 import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/testing";
 
 import manifest from "../src/manifest.js";
-import { registerQuipoEventHandlers } from "../src/event-handlers.js";
+import {
+  commentOriginId,
+  registerQuipoEventHandlers,
+} from "../src/event-handlers.js";
 
 const COMPANY_ID = "00000000-0000-0000-0000-00000000c0c0";
 const PROJECT_ID = "00000000-0000-0000-0000-0000000000a1";
@@ -387,5 +390,147 @@ describe("Quipo event handlers — issue.updated", () => {
         entry.message.includes("extractionScope=comments_only"),
       ),
     ).toBe(true);
+  });
+});
+
+describe("Quipo memory-worker comment — extraction-issue closure (RED-162)", () => {
+  let harness: TestHarness;
+  let extractionIssueId: string;
+
+  function makeReplyComment(overrides: Partial<IssueComment> = {}): IssueComment {
+    const now = new Date();
+    return {
+      id: randomUUID(),
+      companyId: COMPANY_ID,
+      issueId: extractionIssueId,
+      authorAgentId: MEMORY_AGENT_ID,
+      authorUserId: null,
+      body: "",
+      createdAt: now,
+      updatedAt: now,
+      ...overrides,
+    };
+  }
+
+  async function emitWorkerReply(reply: IssueComment) {
+    await harness.emit(
+      "issue.comment.created",
+      {
+        identifier: "RED-77",
+        commentId: reply.id,
+        bodySnippet: reply.body.slice(0, 240),
+        agentId: MEMORY_AGENT_ID,
+        runId: null,
+      },
+      {
+        entityId: extractionIssueId,
+        entityType: "issue",
+        companyId: COMPANY_ID,
+      },
+    );
+  }
+
+  beforeEach(async () => {
+    harness = makeHarness();
+    // Create the extraction issue via the comment-created path so the link
+    // record + idempotency state are set up identically to production.
+    const sourceCommentId = randomUUID();
+    await emitCommentCreated(harness, { commentId: sourceCommentId });
+    const extraction = (await harness.ctx.issues.list({ companyId: COMPANY_ID })).find(
+      (i) => i.originId === commentOriginId(sourceCommentId),
+    );
+    if (!extraction) throw new Error("extraction issue not created in beforeEach");
+    extractionIssueId = extraction.id;
+  });
+
+  it("closes the extraction issue after a single empty {facts:[]} reply", async () => {
+    const reply = makeReplyComment({ body: JSON.stringify({ facts: [] }) });
+    harness.seed({ issueComments: [reply] });
+
+    await emitWorkerReply(reply);
+
+    const closed = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(closed!.status).toBe("done");
+
+    // No fact inserts (empty payload).
+    const factInserts = harness.dbExecutes.filter((e) => /INSERT INTO .*\.facts/.test(e.sql));
+    expect(factInserts).toHaveLength(0);
+  });
+
+  it("force-closes via the prior-comment guard on a second worker reply, without re-running harvest", async () => {
+    // First valid reply: harvest runs, issue closes.
+    const firstReply = makeReplyComment({
+      body: JSON.stringify({
+        facts: [{ content: "X", about_peer: null, confidence: 0.95 }],
+      }),
+    });
+    harness.seed({ issueComments: [firstReply] });
+    await emitWorkerReply(firstReply);
+
+    const factInsertsAfterFirst = harness.dbExecutes.filter((e) =>
+      /INSERT INTO .*\.facts/.test(e.sql),
+    ).length;
+    expect(factInsertsAfterFirst).toBe(1);
+
+    // Simulate a heartbeat-driven stale state: the host re-marks the
+    // extraction issue `in_progress` and the worker posts a second reply.
+    // Without the loop-breaker guard, harvest would re-run (hit
+    // `already_harvested`) — with the guard, it short-circuits before harvest.
+    await harness.ctx.issues.update(
+      extractionIssueId,
+      { status: "in_progress" },
+      COMPANY_ID,
+    );
+    const secondReply = makeReplyComment({
+      body: JSON.stringify({
+        facts: [{ content: "Y", about_peer: null, confidence: 0.9 }],
+      }),
+    });
+    harness.seed({ issueComments: [firstReply, secondReply] });
+
+    await emitWorkerReply(secondReply);
+
+    // Issue is closed again.
+    const closed = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(closed!.status).toBe("done");
+
+    // Crucially, no second harvest ran: fact inserts unchanged.
+    const factInsertsAfterSecond = harness.dbExecutes.filter((e) =>
+      /INSERT INTO .*\.facts/.test(e.sql),
+    ).length;
+    expect(factInsertsAfterSecond).toBe(factInsertsAfterFirst);
+  });
+
+  it("blocks the extraction issue with a reason comment after repeated parse errors", async () => {
+    // First parse_error: issue stays open for retry, no block yet.
+    const garbage1 = makeReplyComment({ body: "definitely not json" });
+    harness.seed({ issueComments: [garbage1] });
+    await emitWorkerReply(garbage1);
+
+    let issue = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(issue!.status).not.toBe("blocked");
+    expect(issue!.status).not.toBe("done");
+
+    // Second parse_error on the same extraction issue: handler must mark
+    // blocked and post a reason comment naming the failure.
+    const garbage2 = makeReplyComment({ body: "still not json {{" });
+    harness.seed({ issueComments: [garbage1, garbage2] });
+    await emitWorkerReply(garbage2);
+
+    issue = await harness.ctx.issues.get(extractionIssueId, COMPANY_ID);
+    expect(issue!.status).toBe("blocked");
+
+    // Reason comment authored by the memory agent, body names the parse
+    // failure.
+    const allComments = await harness.ctx.issues.listComments(extractionIssueId, COMPANY_ID);
+    const reason = allComments.find(
+      (c) =>
+        c.authorAgentId === MEMORY_AGENT_ID &&
+        c.body.includes("Quipo: extraction blocked") &&
+        c.id !== garbage1.id &&
+        c.id !== garbage2.id,
+    );
+    expect(reason).toBeDefined();
+    expect(reason!.body).toContain("could not be parsed");
   });
 });
