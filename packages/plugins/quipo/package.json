@@ -1,9 +1,17 @@
 {
   "name": "@paperclipai/plugin-quipo",
-  "version": "0.1.0",
+  "version": "0.1.0-rc.1",
   "type": "module",
-  "private": true,
-  "description": "Quipo: cross-issue memory plugin (facts, sessions, peer models) backed by ctx.db.",
+  "description": "Quipo: cross-issue memory plugin for Paperclip — extracts and stores facts, session summaries, and peer models so other agents can recall them.",
+  "homepage": "https://github.com/paperclipai/paperclip",
+  "bugs": {
+    "url": "https://github.com/paperclipai/paperclip/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/paperclipai/paperclip",
+    "directory": "packages/plugins/quipo"
+  },
   "main": "./dist/lib/index.js",
   "types": "./dist/lib/index.d.ts",
   "exports": {
@@ -28,7 +36,8 @@
   "files": [
     "dist",
     "migrations",
-    "src/agent-templates"
+    "src/agent-templates",
+    "README.md"
   ],
   "scripts": {
     "prebuild": "pnpm --filter @paperclipai/plugin-sdk ensure-build-deps",
@@ -50,6 +59,9 @@
   ],
   "author": "Paperclip",
   "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "@paperclipai/plugin-sdk": "workspace:*",
     "zod": "^3.24.2"
