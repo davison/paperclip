@@ -638,4 +638,144 @@ describe("harvest path — issue.comment.created integration", () => {
     const harvestState = await harness.ctx.state.get(harvestStateKey(replyId));
     expect((harvestState as { outcome: string }).outcome).toBe("harvested");
   });
+
+  it("RED-210: harvests + closes when payload.agentId is null but the comment row's authorAgentId is the memory agent", async () => {
+    // The activity-log → plugin-event bridge can omit agentId in some
+    // delivery paths (or it may be lost across a worker restart). The harvest
+    // handler must not silently skip these — the comment row's authorAgentId
+    // is the authoritative author signal.
+    const sourceCommentId = randomUUID();
+    await harness.emit(
+      "issue.comment.created",
+      {
+        identifier: "RED-42",
+        commentId: sourceCommentId,
+        bodySnippet: "Some content.",
+        agentId: null,
+        runId: null,
+      },
+      { entityId: SOURCE_ISSUE_ID, entityType: "issue", companyId: COMPANY_ID },
+    );
+    const extraction = (await harness.ctx.issues.list({ companyId: COMPANY_ID })).find(
+      (i) => i.originId === commentOriginId(sourceCommentId),
+    )!;
+
+    const replyBody = JSON.stringify({ facts: [] });
+    const reply = makeComment({
+      id: randomUUID(),
+      issueId: extraction.id,
+      body: replyBody,
+      authorAgentId: MEMORY_AGENT_ID,
+    });
+    harness.seed({ issueComments: [reply] });
+
+    await harness.emit(
+      "issue.comment.created",
+      {
+        identifier: extraction.identifier,
+        commentId: reply.id,
+        bodySnippet: replyBody,
+        // The defining bit: payload.agentId is missing/null even though
+        // authorAgentId on the comment row is set correctly.
+        agentId: null,
+        runId: null,
+      },
+      { entityId: extraction.id, entityType: "issue", companyId: COMPANY_ID },
+    );
+
+    // Empty {facts: []} is a valid harvest result and must close the issue.
+    const harvestState = await harness.ctx.state.get(harvestStateKey(reply.id));
+    expect((harvestState as { outcome: string }).outcome).toBe("empty");
+    const closed = await harness.ctx.issues.get(extraction.id, COMPANY_ID);
+    expect(closed!.status).toBe("done");
+  });
+
+  it("RED-210: skips when payload.agentId is *explicitly* a non-memory agent (fast path, no comment lookup)", async () => {
+    // When the bridge sets agentId to a peer agent, we can short-circuit
+    // before touching the host. Verifies we did not regress the fast path.
+    const sourceCommentId = randomUUID();
+    await harness.emit(
+      "issue.comment.created",
+      {
+        identifier: "RED-42",
+        commentId: sourceCommentId,
+        bodySnippet: "Some content.",
+        agentId: null,
+        runId: null,
+      },
+      { entityId: SOURCE_ISSUE_ID, entityType: "issue", companyId: COMPANY_ID },
+    );
+    const extraction = (await harness.ctx.issues.list({ companyId: COMPANY_ID })).find(
+      (i) => i.originId === commentOriginId(sourceCommentId),
+    )!;
+
+    const before = harness.dbExecutes.length;
+    await harness.emit(
+      "issue.comment.created",
+      {
+        identifier: extraction.identifier,
+        commentId: randomUUID(),
+        bodySnippet: "irrelevant",
+        agentId: PEER_AGENT_ID,
+        runId: null,
+      },
+      { entityId: extraction.id, entityType: "issue", companyId: COMPANY_ID },
+    );
+    const factInserts = harness.dbExecutes.filter((e) => /INSERT INTO .*\.facts/.test(e.sql));
+    expect(factInserts).toHaveLength(0);
+    // No new DB executes triggered by the harvest path beyond what was there
+    // before the irrelevant comment event.
+    expect(harness.dbExecutes.length).toBe(before);
+  });
+
+  it("RED-210: issue.updated retry path closes the extraction issue after a successful harvest", async () => {
+    // Defense in depth: even if `onMemoryWorkerComment` missed the live
+    // event entirely (worker restart, dropped delivery), the retry path on
+    // issue.updated must finish the job and flip the issue to `done`.
+    const sourceCommentId = randomUUID();
+    await harness.emit(
+      "issue.comment.created",
+      {
+        identifier: "RED-42",
+        commentId: sourceCommentId,
+        bodySnippet: "Some content.",
+        agentId: null,
+        runId: null,
+      },
+      { entityId: SOURCE_ISSUE_ID, entityType: "issue", companyId: COMPANY_ID },
+    );
+    const extraction = (await harness.ctx.issues.list({ companyId: COMPANY_ID })).find(
+      (i) => i.originId === commentOriginId(sourceCommentId),
+    )!;
+
+    // Memory-worker reply lands directly in the comments table. The live
+    // `issue.comment.created` was lost (we never emit it).
+    const replyBody = JSON.stringify({ facts: [] });
+    const reply = makeComment({
+      id: randomUUID(),
+      issueId: extraction.id,
+      body: replyBody,
+      authorAgentId: MEMORY_AGENT_ID,
+    });
+    harness.seed({ issueComments: [reply] });
+
+    // Some unrelated update fires (e.g. another agent edits a field). The
+    // retry path scans memory-worker comments, harvests the empty reply, and
+    // must close the still-open extraction issue.
+    await harness.emit(
+      "issue.updated",
+      {
+        identifier: extraction.identifier,
+        patch: { description: "edited from elsewhere" },
+        agentId: null,
+        runId: null,
+      },
+      { entityId: extraction.id, entityType: "issue", companyId: COMPANY_ID },
+    );
+
+    const harvestState = await harness.ctx.state.get(harvestStateKey(reply.id));
+    expect((harvestState as { outcome: string }).outcome).toBe("empty");
+    const closed = await harness.ctx.issues.get(extraction.id, COMPANY_ID);
+    expect(closed!.status).toBe("done");
+  });
 });

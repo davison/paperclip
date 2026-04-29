@@ -554,11 +554,18 @@ export async function onMemoryWorkerComment(
   const memoryAgentId = config.memoryAgentId;
   if (!memoryAgentId) return;
 
-  // Only process comments authored by the memory-worker.
-  if (!payload.agentId || payload.agentId !== memoryAgentId) return;
-
   const sourceIssueId = event.entityId;
   if (!sourceIssueId) return;
+
+  // Fast skip when payload.agentId is *explicitly* set to a non-memory agent
+  // — saves the issue + comments lookup for the common case of board users
+  // and peer agents commenting on extraction issues. We deliberately do NOT
+  // bail when payload.agentId is null/undefined: the activity-log → plugin
+  // event bridge can omit agentId in some delivery paths (RED-210), and the
+  // comment row's authorAgentId is the authoritative source of truth for who
+  // wrote the comment. Gating only on payload.agentId would silently skip
+  // valid memory-worker harvests.
+  if (payload.agentId && payload.agentId !== memoryAgentId) return;
 
   // Comments live on the extraction issue (plugin-owned); skip non-plugin
   // issues fast.
@@ -597,6 +604,14 @@ export async function onMemoryWorkerComment(
     );
     return;
   }
+
+  // RED-210: authoritative author check. payload.agentId can be null in some
+  // event delivery paths even though the comment row carries the correct
+  // authorAgentId, so trust the row. Non-memory-worker comments on extraction
+  // issues (e.g. a board user noting something) carry no JSON facts and must
+  // not run through the harvest parser.
+  if (target.authorAgentId !== memoryAgentId) return;
+
   const fullBody = target.body ?? "";
   if (!fullBody) {
     ctx.logger.warn("Quipo: empty memory-worker comment body — skipping harvest", {
@@ -679,6 +694,7 @@ export async function onExtractionIssueUpdated(
   if (!link) return;
 
   const comments = await ctx.issues.listComments(issue.id, event.companyId);
+  let didHarvest = false;
   for (const c of comments) {
     if (c.authorAgentId !== memoryAgentId) continue;
     if (!c.body) continue;
@@ -686,7 +702,7 @@ export async function onExtractionIssueUpdated(
     const existing = await ctx.state.get(harvestStateKey(c.id));
     if (existing) continue;
 
-    await harvestExtraction(ctx, {
+    const result = await harvestExtraction(ctx, {
       companyId: event.companyId,
       commentBody: c.body,
       commentId: c.id,
@@ -694,6 +710,31 @@ export async function onExtractionIssueUpdated(
       link,
       extractionRunId: null,
     });
+    if (result.status === "harvested" || result.status === "empty") {
+      didHarvest = true;
+    }
+  }
+
+  // RED-210: defense in depth. If `onMemoryWorkerComment` missed the live
+  // event (e.g. delivery dropped during a worker restart, payload.agentId
+  // was null), the harvest issue can stay `in_progress` forever even after
+  // the retry path successfully harvested the comment. Close it here whenever
+  // we did harvest a fresh memory-worker comment and the issue is still open.
+  if (didHarvest && issue.status !== "done") {
+    try {
+      await ctx.issues.update(
+        issue.id,
+        { status: "done" },
+        event.companyId,
+        { actorAgentId: memoryAgentId, actorRunId: null },
+      );
+    } catch (err) {
+      const detail = err instanceof Error ? err.message : String(err);
+      ctx.logger.debug("Quipo: could not close extraction issue from retry path (non-fatal)", {
+        extractionIssueId: issue.id,
+        detail,
+      });
+    }
   }
 }
 
