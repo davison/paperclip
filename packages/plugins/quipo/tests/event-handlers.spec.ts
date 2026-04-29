@@ -6,9 +6,12 @@ import { createTestHarness, type TestHarness } from "@paperclipai/plugin-sdk/tes
 
 import manifest from "../src/manifest.js";
 import {
+  MAX_BATCHED_DEDUPE_ENTRIES,
   commentOriginId,
+  extractionSourceStateKey,
   parseErrorCountStateKey,
   registerQuipoEventHandlers,
+  updateOriginId,
 } from "../src/event-handlers.js";
 
 const COMPANY_ID = "00000000-0000-0000-0000-00000000c0c0";
@@ -150,6 +153,86 @@ describe("Quipo event handlers — issue.comment.created", () => {
     expect(extraction!.description).toContain(commentId);
     expect(extraction!.description).toContain("We agreed to use TypeScript");
     expect(extraction!.originKind).toBe(`plugin:${manifest.id}`);
+    // RED-163: extraction issues are created hidden so they do not pollute
+    // the human-facing default `/issues` list view. The server's
+    // `?includeHidden=true` filter is the admin opt-in for diagnostics.
+    expect(extraction!.hiddenAt).toBeInstanceOf(Date);
+  });
+
+  it("RED-163: batches a second comment on the same source into the open extraction (no second issue)", async () => {
+    const { commentId: firstCommentId } = await emitCommentCreated(harness);
+    const allAfterFirst = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const firstExtraction = allAfterFirst.find((issue) => issue.originId === `comment:${firstCommentId}`);
+    expect(firstExtraction).toBeDefined();
+
+    // Fresh comment on the same source — must NOT create a second extraction
+    // issue; must append to the existing one as a batched comment.
+    const { commentId: secondCommentId } = await emitCommentCreated(harness);
+    expect(secondCommentId).not.toBe(firstCommentId);
+
+    const allAfterSecond = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = allAfterSecond.filter(
+      (issue) =>
+        issue.originKind === `plugin:${manifest.id}` &&
+        typeof issue.originId === "string" &&
+        issue.originId.startsWith("comment:"),
+    );
+    expect(extractions).toHaveLength(1);
+    expect(extractions[0].id).toBe(firstExtraction!.id);
+
+    const comments = await harness.ctx.issues.listComments(firstExtraction!.id, COMPANY_ID);
+    const batched = comments.find((c) => c.body.includes(`comment id: ${secondCommentId}`));
+    expect(batched, "second comment must be appended as a batched comment").toBeDefined();
+    expect(batched!.body).toContain("batched into the same extraction");
+  });
+
+  it("RED-163: dedupes per (sourceIssueId, commentId) — replayed second-comment events do not re-append", async () => {
+    await emitCommentCreated(harness);
+    const sharedSecondCommentId = randomUUID();
+    await emitCommentCreated(harness, { commentId: sharedSecondCommentId });
+    // Replay of the same second-comment event (at-least-once redelivery).
+    await emitCommentCreated(harness, { commentId: sharedSecondCommentId });
+
+    const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all.filter(
+      (issue) =>
+        issue.originKind === `plugin:${manifest.id}` &&
+        typeof issue.originId === "string" &&
+        issue.originId.startsWith("comment:"),
+    );
+    expect(extractions).toHaveLength(1);
+    const comments = await harness.ctx.issues.listComments(extractions[0].id, COMPANY_ID);
+    const batchedForReplay = comments.filter((c) =>
+      c.body.includes(`comment id: ${sharedSecondCommentId}`),
+    );
+    expect(batchedForReplay).toHaveLength(1);
+  });
+
+  it("RED-163: opens a fresh extraction after the previous one closes", async () => {
+    const { commentId: firstCommentId } = await emitCommentCreated(harness);
+    const allAfterFirst = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const firstExtraction = allAfterFirst.find((issue) => issue.originId === `comment:${firstCommentId}`);
+    expect(firstExtraction).toBeDefined();
+
+    // Simulate a successful harvest that closes the extraction issue and
+    // clears the per-source state (the close path inside `closeExtractionIssue`
+    // does this via the link record).
+    await harness.ctx.issues.update(firstExtraction!.id, { status: "done" }, COMPANY_ID, {
+      actorAgentId: MEMORY_AGENT_ID,
+    });
+    await harness.ctx.state.delete({
+      scopeKind: "instance",
+      namespace: "extractions",
+      stateKey: `source:${SOURCE_ISSUE_ID}`,
+    });
+
+    // The next fact-bearing comment on the same source must open a fresh
+    // extraction, not silently disappear.
+    const { commentId: laterCommentId } = await emitCommentCreated(harness);
+    const allAfterLater = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const laterExtraction = allAfterLater.find((issue) => issue.originId === `comment:${laterCommentId}`);
+    expect(laterExtraction).toBeDefined();
+    expect(laterExtraction!.id).not.toBe(firstExtraction!.id);
   });
 
   it("is idempotent: repeat events for the same comment do not duplicate the extraction issue", async () => {
@@ -158,6 +241,78 @@ describe("Quipo event handlers — issue.comment.created", () => {
     const all = await harness.ctx.issues.list({ companyId: COMPANY_ID });
     const extractions = all.filter((issue) => issue.originId === `comment:${commentId}`);
     expect(extractions).toHaveLength(1);
+  });
+
+  it("RED-173: caps per-source batchedCommentIds at MAX_BATCHED_DEDUPE_ENTRIES (no unbounded growth)", async () => {
+    // Open an extraction issue for the source.
+    const { commentId: firstCommentId } = await emitCommentCreated(harness);
+    const allAfterFirst = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extraction = allAfterFirst.find((issue) => issue.originId === `comment:${firstCommentId}`);
+    expect(extraction).toBeDefined();
+
+    // Pre-fill the per-source dedupe array with MAX_BATCHED_DEDUPE_ENTRIES
+    // synthetic comment ids so we exercise the cap without emitting thousands
+    // of events. This simulates a long-lived open extraction on a high-volume
+    // source.
+    const stateKey = extractionSourceStateKey(SOURCE_ISSUE_ID);
+    const synthetic = Array.from({ length: MAX_BATCHED_DEDUPE_ENTRIES }, (_, i) => `synthetic-${i}`);
+    await harness.ctx.state.set(stateKey, {
+      openExtractionIssueId: extraction!.id,
+      batchedCommentIds: [firstCommentId, ...synthetic],
+      batchedUpdateOriginIds: [],
+    });
+
+    // Real fresh comment must batch and the dedupe array must stay bounded.
+    const { commentId: nextCommentId } = await emitCommentCreated(harness);
+    const stateAfter = (await harness.ctx.state.get(stateKey)) as
+      | { batchedCommentIds: string[]; batchedUpdateOriginIds: string[]; openExtractionIssueId: string | null }
+      | null;
+    expect(stateAfter).not.toBeNull();
+    expect(stateAfter!.openExtractionIssueId).toBe(extraction!.id);
+    expect(stateAfter!.batchedCommentIds.length).toBeLessThanOrEqual(MAX_BATCHED_DEDUPE_ENTRIES);
+    // The newest entry must be retained — it's the redelivery dedupe anchor.
+    expect(stateAfter!.batchedCommentIds.at(-1)).toBe(nextCommentId);
+    // The oldest entry (the original first comment) must have been evicted in
+    // favour of the newer ones.
+    expect(stateAfter!.batchedCommentIds).not.toContain(firstCommentId);
+  });
+
+  it("RED-173: re-queues a comment when the linked extraction has closed and per-source state was not cleared (partial-failure recovery)", async () => {
+    // Open an extraction so we have a real extraction issue id to point at.
+    const { commentId: firstCommentId } = await emitCommentCreated(harness);
+    const all1 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const firstExtraction = all1.find((issue) => issue.originId === `comment:${firstCommentId}`);
+    expect(firstExtraction).toBeDefined();
+
+    // Close the extraction (simulate harvest) but DO NOT clear per-source
+    // state — simulates a close-time race / partial failure where
+    // `clearSourceBatchStateForExtraction` never ran. The pre-fix code would
+    // trust the stale `batchedCommentIds` membership and silently drop the
+    // next event for any matching id, dropping fact-bearing extraction work.
+    await harness.ctx.issues.update(firstExtraction!.id, { status: "done" }, COMPANY_ID, {
+      actorAgentId: MEMORY_AGENT_ID,
+    });
+
+    // Pre-fill stale source-state: openExtractionIssueId points at the now-
+    // closed extraction; batchedCommentIds includes a replayed commentId for
+    // which per-comment idempotency state has been lost (matching the cross-
+    // process / cross-restart fallback rationale this branch was designed for).
+    const replayedCommentId = randomUUID();
+    await harness.ctx.state.set(extractionSourceStateKey(SOURCE_ISSUE_ID), {
+      openExtractionIssueId: firstExtraction!.id,
+      batchedCommentIds: [firstCommentId, replayedCommentId],
+      batchedUpdateOriginIds: [],
+    });
+
+    await emitCommentCreated(harness, { commentId: replayedCommentId });
+
+    const all2 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const matching = all2.filter((issue) => issue.originId === `comment:${replayedCommentId}`);
+    expect(
+      matching,
+      "fresh extraction must open when the linked extraction is no longer processable",
+    ).toHaveLength(1);
+    expect(matching[0].id).not.toBe(firstExtraction!.id);
   });
 
   it("is idempotent under concurrent delivery of the same comment", async () => {
@@ -286,9 +441,12 @@ describe("Quipo event handlers — issue.updated", () => {
     expect(extractions).toHaveLength(1);
   });
 
-  it("re-extracts when the source issue is genuinely updated again (new updatedAt)", async () => {
-    // Sanity check the new key: a *new* logical update should produce a new
-    // extraction even though the source issue id is the same.
+  it("batches a second genuine update into the same open extraction (RED-163)", async () => {
+    // RED-163: while an extraction issue for this source is still open, a
+    // *new* logical update on the same source must NOT spawn a second
+    // extraction — it must be folded into the open one as an additional
+    // comment. The memory-worker re-reads the issue body on its next wake
+    // and harvests all batched patches together.
     await emitIssueUpdated(harness, { patch: { title: "First rename" } });
 
     // Re-seed the source issue with a later updatedAt to simulate a real
@@ -303,7 +461,95 @@ describe("Quipo event handlers — issue.updated", () => {
     const extractions = all.filter((issue) =>
       typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
     );
+    expect(extractions).toHaveLength(1);
+    // The second update should appear as an appended comment on the open
+    // extraction issue.
+    const [openExtraction] = extractions;
+    const comments = await harness.ctx.issues.listComments(openExtraction.id, COMPANY_ID);
+    const appendedFromUpdate = comments.find((c) => c.body.includes("batched into the same extraction"));
+    expect(appendedFromUpdate, "expected the second update to be appended as a batched comment").toBeDefined();
+  });
+
+  it("re-extracts after the previous extraction is closed (RED-163)", async () => {
+    // Once the memory-worker harvests and the extraction issue flips to
+    // `done`, the per-source batch state must clear so the next update on
+    // the source opens a fresh extraction ticket.
+    await emitIssueUpdated(harness, { patch: { title: "First rename" } });
+    const all1 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const first = all1.find(
+      (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(first, "first extraction issue must exist").toBeDefined();
+
+    // Simulate a successful harvest closing the issue.
+    await harness.ctx.issues.update(first!.id, { status: "done" }, COMPANY_ID, {
+      actorAgentId: MEMORY_AGENT_ID,
+    });
+    // Clear the per-source state via the public state API the way the close
+    // path does — the harness's `update` does not run plugin event handlers.
+    await harness.ctx.state.delete({
+      scopeKind: "instance",
+      namespace: "extractions",
+      stateKey: `source:${SOURCE_ISSUE_ID}`,
+    });
+
+    // A genuinely new logical update on the (now-quiet) source should open a
+    // fresh extraction.
+    const later = new Date(Date.now() + 60_000);
+    harness.seed({
+      issues: [makeIssue({ updatedAt: later, title: "Renamed again" })],
+    });
+    await emitIssueUpdated(harness, { patch: { title: "Renamed again" } });
+    const all2 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all2.filter(
+      (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
     expect(extractions).toHaveLength(2);
+  });
+
+  it("RED-173: re-queues an update when the linked extraction has closed and per-source state was not cleared (partial-failure recovery)", async () => {
+    // Open an extraction.
+    await emitIssueUpdated(harness, { patch: { title: "First rename" } });
+    const all1 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const first = all1.find(
+      (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    expect(first).toBeDefined();
+
+    // Close the extraction without clearing per-source state — simulates a
+    // close-time race / partial failure where cleanup never ran.
+    await harness.ctx.issues.update(first!.id, { status: "done" }, COMPANY_ID, {
+      actorAgentId: MEMORY_AGENT_ID,
+    });
+
+    // Re-seed the source with a later updatedAt and pre-load stale source
+    // state where `batchedUpdateOriginIds` already contains the originId the
+    // next event will produce. Pre-fix the handler would short-circuit on
+    // membership alone and drop the event despite the linked extraction being
+    // closed.
+    const later = new Date(Date.now() + 60_000);
+    harness.seed({
+      issues: [makeIssue({ updatedAt: later, title: "Renamed again" })],
+    });
+    const replayedOriginId = updateOriginId(SOURCE_ISSUE_ID, later);
+    await harness.ctx.state.set(extractionSourceStateKey(SOURCE_ISSUE_ID), {
+      openExtractionIssueId: first!.id,
+      batchedCommentIds: [],
+      batchedUpdateOriginIds: [replayedOriginId],
+    });
+
+    await emitIssueUpdated(harness, { patch: { title: "Renamed again" } });
+
+    const all2 = await harness.ctx.issues.list({ companyId: COMPANY_ID });
+    const extractions = all2.filter(
+      (issue) => typeof issue.originId === "string" && issue.originId.startsWith(`update:${SOURCE_ISSUE_ID}:`),
+    );
+    // Two distinct extraction issues: the original (now done) and a fresh one
+    // for the replayed update.
+    expect(extractions).toHaveLength(2);
+    const replayed = extractions.find((issue) => issue.originId === replayedOriginId);
+    expect(replayed, "fresh extraction must open when linked one is closed").toBeDefined();
+    expect(replayed!.id).not.toBe(first!.id);
   });
 
   it("is idempotent under concurrent delivery of the same logical update", async () => {

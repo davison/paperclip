@@ -766,6 +766,7 @@ export interface WorkerToHostMethods {
       executionWorkspaceId?: string | null;
       executionWorkspacePreference?: string | null;
       executionWorkspaceSettings?: Record<string, unknown> | null;
+      hiddenAt?: string | null;
       actorAgentId?: string | null;
       actorUserId?: string | null;
       actorRunId?: string | null;

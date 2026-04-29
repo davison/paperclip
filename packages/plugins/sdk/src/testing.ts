@@ -720,7 +720,12 @@ export function createTestHarness(options: TestHarnessOptions): TestHarness {
           startedAt: null,
           completedAt: null,
           cancelledAt: null,
-          hiddenAt: null,
+          hiddenAt:
+            input.hiddenAt instanceof Date
+              ? input.hiddenAt
+              : typeof input.hiddenAt === "string" && input.hiddenAt.length > 0
+                ? new Date(input.hiddenAt)
+                : null,
           createdAt: now,
           updatedAt: now,
         };

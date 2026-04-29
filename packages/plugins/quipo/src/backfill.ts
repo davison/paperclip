@@ -339,6 +339,13 @@ export async function runBackfill(
 
       switch (result.status) {
         case "queued":
+        case "appended":
+          // RED-163 batching: "appended" folds the comment into an
+          // already-open extraction issue for the same source. From the
+          // backfill's perspective the comment was successfully enqueued for
+          // extraction, so it counts towards the same total as a fresh
+          // "queued" issue. The sample list captures the underlying
+          // extraction issue id either way.
           summary.queued += 1;
           if (summary.sampleExtractionIssueIds.length < SAMPLE_LIMIT) {
             summary.sampleExtractionIssueIds.push(result.extractionIssueId);

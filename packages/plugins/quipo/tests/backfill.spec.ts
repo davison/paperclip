@@ -164,10 +164,13 @@ describe("Quipo backfill — happy path", () => {
     harness.seed({ issueComments: [...issueAComments, issueBComment] });
   });
 
-  it("queues an extraction issue per existing comment with sourceKind=backfill in the description", async () => {
+  it("enqueues every comment for extraction, batching same-source comments into one open issue (RED-163)", async () => {
     const result = await performBackfill(harness);
 
     expect(result.ok).toBe(true);
+    // `queued` counts every comment successfully enqueued for extraction —
+    // both fresh extraction issues and comments appended to an existing open
+    // extraction (RED-163 batching). Three comments → three enqueues.
     expect(result.queued).toBe(3);
     expect(result.alreadyExtracted).toBe(0);
     expect(result.commentsScanned).toBe(3);
@@ -181,7 +184,9 @@ describe("Quipo backfill — happy path", () => {
         typeof issue.originId === "string" &&
         issue.originId.startsWith("comment:"),
     );
-    expect(extractions).toHaveLength(3);
+    // RED-163: with batching there is exactly one open extraction issue per
+    // source — ISSUE_A (2 comments → second appended) and ISSUE_B (1 comment).
+    expect(extractions).toHaveLength(2);
     for (const ex of extractions) {
       expect(ex.assigneeAgentId).toBe(MEMORY_AGENT_ID);
       expect(ex.priority).toBe("low");
@@ -189,6 +194,18 @@ describe("Quipo backfill — happy path", () => {
       expect(ex.description).toContain("RED-103 backfill");
       expect(ex.description).toContain("source_comment_id:");
     }
+
+    // The second ISSUE_A comment must show up as an appended batched comment
+    // on the (single) ISSUE_A extraction issue.
+    const issueAExtraction = extractions.find((ex) =>
+      ex.description?.includes(`source issue: ${ISSUE_A}`),
+    );
+    expect(issueAExtraction, "ISSUE_A extraction issue must exist").toBeDefined();
+    const aComments = await harness.ctx.issues.listComments(issueAExtraction!.id, COMPANY_ID);
+    const batchedComments = aComments.filter((c) =>
+      c.body.includes("batched into the same extraction"),
+    );
+    expect(batchedComments).toHaveLength(1);
   });
 
   it("records source_comment_id in plugin state for each queued extraction", async () => {
