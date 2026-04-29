@@ -82,6 +82,11 @@ const MAX_LIVE_LOG_CHUNK_BYTES = 8 * 1024;
 const MAX_PERSISTED_LOG_CHUNK_CHARS = 64 * 1024;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_DEFAULT = 1;
 const HEARTBEAT_MAX_CONCURRENT_RUNS_MAX = 10;
+// Empty-response circuit breaker. If an agent produces this many consecutive
+// succeeded heartbeat runs on the same issue without posting a comment, escalate
+// the issue to `blocked` instead of letting reconcile re-fire indefinitely.
+// See RED-160 (memory-worker 96-heartbeat loop) for the failure mode.
+const MAX_CONSECUTIVE_NO_PROGRESS_RUNS = 3;
 const DEFERRED_WAKE_CONTEXT_KEY = "_paperclipWakeContext";
 const WAKE_COMMENT_IDS_KEY = "wakeCommentIds";
 const PAPERCLIP_WAKE_PAYLOAD_KEY = "paperclipWake";
@@ -2298,6 +2303,47 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
+  /**
+   * Walk backwards through the most recent heartbeat runs on an issue and count
+   * how many of them ended in `succeeded` without posting any issue comment.
+   * Stops counting at the first run that either failed/timed-out/was cancelled
+   * or did post a comment — the result is the length of the most recent
+   * consecutive "no-progress" streak, not a total over the window.
+   *
+   * Used by the empty-response circuit breaker to detect agents that finish
+   * cleanly each heartbeat but never produce visible output (RED-160).
+   */
+  async function countConsecutiveNoProgressRuns(
+    companyId: string,
+    issueId: string,
+    limit: number,
+  ): Promise<number> {
+    if (limit <= 0) return 0;
+    const recentRuns = await db
+      .select({
+        id: heartbeatRuns.id,
+        status: heartbeatRuns.status,
+      })
+      .from(heartbeatRuns)
+      .where(
+        and(
+          eq(heartbeatRuns.companyId, companyId),
+          sql`${heartbeatRuns.contextSnapshot} ->> 'issueId' = ${issueId}`,
+        ),
+      )
+      .orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id))
+      .limit(limit);
+
+    let count = 0;
+    for (const candidate of recentRuns) {
+      if (candidate.status !== "succeeded") break;
+      const postedComment = await findRunIssueComment(candidate.id, companyId, issueId);
+      if (postedComment) break;
+      count += 1;
+    }
+    return count;
+  }
+
   async function enqueueMissingIssueCommentRetry(
     run: typeof heartbeatRuns.$inferSelect,
     agent: typeof agents.$inferSelect,
@@ -3093,6 +3139,39 @@ export function heartbeatService(db: Db) {
             "Paperclip automatically retried continuation for this assigned `in_progress` issue after its live " +
             `execution disappeared, but it still has no live execution path.${failureSummary ?? ""} ` +
             "Moving it to `blocked` so it is visible for intervention.",
+        });
+        if (updated) {
+          result.escalated += 1;
+          result.issueIds.push(issue.id);
+        } else {
+          result.skipped += 1;
+        }
+        continue;
+      }
+
+      // Empty-response circuit breaker. The continuation-recovery escalation
+      // above only fires when the previous reconcile re-fire was the latest
+      // run; intermediate `missing_issue_comment` retries (queued by
+      // `finalizeIssueCommentPolicy`) hide the continuation history and the
+      // chain re-arms each tick. Independent of retryReason, count how many
+      // recent consecutive runs succeeded without posting any comment, and
+      // escalate once the threshold is reached so a stuck agent cannot burn
+      // an unbounded heartbeat budget on the same issue (RED-160).
+      const noProgressRuns = await countConsecutiveNoProgressRuns(
+        issue.companyId,
+        issue.id,
+        MAX_CONSECUTIVE_NO_PROGRESS_RUNS,
+      );
+      if (noProgressRuns >= MAX_CONSECUTIVE_NO_PROGRESS_RUNS) {
+        const updated = await escalateStrandedAssignedIssue({
+          issue,
+          previousStatus: "in_progress",
+          latestRun,
+          comment:
+            `Paperclip detected ${noProgressRuns} consecutive succeeded heartbeat runs on this ` +
+            "`in_progress` issue that posted no comment — the agent appears to be running but " +
+            "producing no visible output, and the issue did not self-close. Moving to `blocked` " +
+            "to stop the heartbeat loop and surface this for intervention.",
         });
         if (updated) {
           result.escalated += 1;

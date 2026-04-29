@@ -650,6 +650,106 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("Latest retry failure: `process_lost` - run failed before issue advanced.");
   });
 
+  it("blocks stranded in-progress work after consecutive succeeded runs posted no comments (RED-160 empty-response circuit breaker)", async () => {
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+    });
+
+    // Seed two earlier succeeded runs on the same issue with no comments;
+    // combined with the fixture's succeeded latest run, that's three
+    // consecutive no-progress runs — the circuit breaker should fire.
+    for (let i = 0; i < 2; i += 1) {
+      const extraRunId = randomUUID();
+      const startedAt = new Date(Date.UTC(2026, 2, 18, 0, 10 + i * 5));
+      const finishedAt = new Date(Date.UTC(2026, 2, 18, 0, 11 + i * 5));
+      await db.insert(heartbeatRuns).values({
+        id: extraRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        wakeupRequestId: null,
+        contextSnapshot: { issueId, taskId: issueId },
+        startedAt,
+        finishedAt,
+        updatedAt: finishedAt,
+      });
+    }
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.dispatchRequeued).toBe(0);
+    expect(result.escalated).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("blocked");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("consecutive succeeded heartbeat runs");
+    expect(comments[0]?.body).toContain("posted no comment");
+  });
+
+  it("does not trip the empty-response circuit breaker when a recent run posted a comment (RED-160)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+    });
+
+    // Two earlier silent runs precede the fixture's latest run. The latest
+    // run's comment resets the no-progress streak, so reconcile should fall
+    // through to a normal continuation re-queue, not escalate.
+    for (let i = 0; i < 2; i += 1) {
+      const extraRunId = randomUUID();
+      const startedAt = new Date(Date.UTC(2026, 2, 18, 0, 10 + i * 5));
+      const finishedAt = new Date(Date.UTC(2026, 2, 18, 0, 11 + i * 5));
+      await db.insert(heartbeatRuns).values({
+        id: extraRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        wakeupRequestId: null,
+        contextSnapshot: { issueId, taskId: issueId },
+        startedAt,
+        finishedAt,
+        updatedAt: finishedAt,
+      });
+    }
+    await db.insert(issueComments).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      authorAgentId: agentId,
+      createdByRunId: runId,
+      body: "progress comment from latest run",
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const issueAfter = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issueAfter?.status).toBe("in_progress");
+
+    // Drain the queued continuation retry so the afterEach cleanup doesn't race
+    // with an in-flight run.
+    const allRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+    const retryRun = allRuns.find(
+      (row) => (row.contextSnapshot as Record<string, unknown> | null)?.retryReason === "issue_continuation_needed",
+    );
+    if (retryRun) {
+      await waitForRunToSettle(heartbeat, retryRun.id);
+    }
+  });
+
   it("does not reconcile user-assigned work through the agent stranded-work recovery path", async () => {
     const { issueId, runId } = await seedStrandedIssueFixture({
       status: "todo",
