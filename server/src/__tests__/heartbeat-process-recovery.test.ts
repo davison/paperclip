@@ -694,6 +694,76 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(comments[0]?.body).toContain("posted no comment");
   });
 
+  it("does not escalate to blocked when an active run exists alongside the no-progress streak (RED-167 race gate)", async () => {
+    // Defense-in-depth test for the QA-VETO finding on RED-160. Even when the
+    // empty-response streak (3 silent succeeded runs) is satisfied, the
+    // escalation must NOT fire if a fresh continuation run is already active
+    // for the issue. The reconcile precondition (hasActiveExecutionPath) catches
+    // the obvious case; the locked compare-and-set inside
+    // escalateStrandedAssignedIssue catches the race where a new run appears
+    // between the precondition and the mutation. This test asserts the
+    // end-state property: an active run on the issue must keep it in_progress.
+    const { companyId, agentId, issueId } = await seedStrandedIssueFixture({
+      status: "in_progress",
+      runStatus: "succeeded",
+    });
+
+    // Three silent succeeded runs in the recent history — streak = 3.
+    for (let i = 0; i < 2; i += 1) {
+      const extraRunId = randomUUID();
+      const startedAt = new Date(Date.UTC(2026, 2, 18, 0, 10 + i * 5));
+      const finishedAt = new Date(Date.UTC(2026, 2, 18, 0, 11 + i * 5));
+      await db.insert(heartbeatRuns).values({
+        id: extraRunId,
+        companyId,
+        agentId,
+        invocationSource: "automation",
+        triggerDetail: "system",
+        status: "succeeded",
+        wakeupRequestId: null,
+        contextSnapshot: { issueId, taskId: issueId },
+        startedAt,
+        finishedAt,
+        updatedAt: finishedAt,
+      });
+    }
+
+    // A new continuation run is already queued for this issue — execution is
+    // live. Escalation must not block the issue while this run can resume.
+    const liveRunId = randomUUID();
+    const liveStartedAt = new Date(Date.UTC(2026, 2, 19, 1, 0));
+    await db.insert(heartbeatRuns).values({
+      id: liveRunId,
+      companyId,
+      agentId,
+      invocationSource: "automation",
+      triggerDetail: "system",
+      status: "queued",
+      wakeupRequestId: null,
+      contextSnapshot: {
+        issueId,
+        taskId: issueId,
+        wakeReason: "issue_continuation_needed",
+        retryReason: "issue_continuation_needed",
+      },
+      startedAt: liveStartedAt,
+      updatedAt: liveStartedAt,
+    });
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.escalated).toBe(0);
+
+    const issue = await db.select().from(issues).where(eq(issues.id, issueId)).then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, issueId));
+    expect(comments).toHaveLength(0);
+
+    // Drain the queued live run so afterEach cleanup is not racing with it.
+    await waitForRunToSettle(heartbeat, liveRunId);
+  });
+
   it("does not trip the empty-response circuit breaker when a recent run posted a comment (RED-160)", async () => {
     const { companyId, agentId, issueId, runId } = await seedStrandedIssueFixture({
       status: "in_progress",

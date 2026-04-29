@@ -2927,9 +2927,14 @@ export function heartbeatService(db: Db) {
       .then((rows) => rows[0] ?? null);
   }
 
-  async function hasActiveExecutionPath(companyId: string, issueId: string) {
+  async function hasActiveExecutionPath(
+    companyId: string,
+    issueId: string,
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    dbOrTx: any = db,
+  ) {
     const [run, deferredWake] = await Promise.all([
-      db
+      dbOrTx
         .select({ id: heartbeatRuns.id })
         .from(heartbeatRuns)
         .where(
@@ -2940,8 +2945,8 @@ export function heartbeatService(db: Db) {
           ),
         )
         .limit(1)
-        .then((rows) => rows[0] ?? null),
-      db
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null),
+      dbOrTx
         .select({ id: agentWakeupRequests.id })
         .from(agentWakeupRequests)
         .where(
@@ -2952,7 +2957,7 @@ export function heartbeatService(db: Db) {
           ),
         )
         .limit(1)
-        .then((rows) => rows[0] ?? null),
+        .then((rows: Array<{ id: string }>) => rows[0] ?? null),
     ]);
 
     return Boolean(run || deferredWake);
@@ -3010,8 +3015,34 @@ export function heartbeatService(db: Db) {
     > | null;
     comment: string;
   }) {
-    const updated = await issuesSvc.update(input.issue.id, {
-      status: "blocked",
+    // RED-167: gate the status flip on a locked compare-and-set so a new
+    // continuation run that races in between the precondition check and the
+    // mutation cannot be silently blocked. Lock the issue row, re-verify
+    // (a) it is still in `previousStatus`, (b) it is still assigned to the
+    // same agent with no human assignee, and (c) there is still no active
+    // heartbeat run / deferred wake for it — all inside the same tx as the
+    // status update. Any concurrent state change aborts the escalation; the
+    // caller treats `null` as "skipped" and the next reconcile pass re-checks.
+    const updated = await db.transaction(async (tx) => {
+      await tx.execute(
+        sql`select ${issues.id} from ${issues} where ${issues.id} = ${input.issue.id} for update`,
+      );
+
+      const current = await tx
+        .select()
+        .from(issues)
+        .where(eq(issues.id, input.issue.id))
+        .then((rows) => rows[0] ?? null);
+      if (!current) return null;
+      if (current.status !== input.previousStatus) return null;
+      if (current.assigneeUserId) return null;
+      if (current.assigneeAgentId !== input.issue.assigneeAgentId) return null;
+
+      if (await hasActiveExecutionPath(input.issue.companyId, input.issue.id, tx)) {
+        return null;
+      }
+
+      return issuesSvc.update(input.issue.id, { status: "blocked" }, tx);
     });
     if (!updated) return null;
 
